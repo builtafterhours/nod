@@ -28,6 +28,8 @@ export interface MessagingChannel {
   available?: boolean;
   error?: string;
   presenceMs?: number;
+  rich?: boolean;
+  richError?: string;
 }
 
 export interface MessagingAttachment {
@@ -57,6 +59,37 @@ export interface InboundReaction {
   senderId: string;
   messageId: string;
   reaction: string | null;
+  displayOnly?: boolean;
+}
+
+export interface MessagingControl {
+  channelId: string;
+  accountId: string;
+  senderId: string;
+  threadId: string;
+  eventId: string;
+  rootMessageId: string;
+  action: 'stop' | 'status';
+  nonce?: string;
+  messageId?: string;
+  streamIds?: string[];
+}
+
+export interface MessagingConversation {
+  ownerId: string;
+  channelId: string;
+  accountId: string;
+  threadId: string;
+  sessionId: string;
+  turnId: string;
+  rootMessageId: string;
+  status: 'processing' | 'active' | 'suspended' | 'closed';
+  title: string;
+  text: string;
+  control?: { stop: string; status: string };
+  task?: { state: string; steps: string[]; stepIndex: number };
+  outcome?: 'failed' | 'cancelled';
+  signal: AbortSignal;
 }
 
 export interface ChannelPairingRequest {
@@ -90,6 +123,8 @@ export interface MessagingWebhookResult {
 
 export interface MessagingTransport {
   channels: MessagingChannel[];
+  controls?(accept: (control: MessagingControl) => Promise<void>): () => void;
+  conversation?(input: MessagingConversation): Promise<{ id?: string }>;
   pairing?(): Promise<ChannelLinkStatus>;
   cancelPairing?(pairingId: string, restart?: boolean): Promise<boolean>;
   unlink?(): Promise<void>;
@@ -108,6 +143,24 @@ export interface MessagingTransport {
     replyToMessageId?: string;
     replyToText?: string;
     attachmentFailure?: (names: string[]) => Promise<string | undefined>;
+    rootMessageId?: string;
+    deliveryId?: string;
+    stream?: {
+      record(input: {
+        part: number;
+        state:
+          | 'starting'
+          | 'dispatching'
+          | 'open'
+          | 'appending'
+          | 'finalizing'
+          | 'finalized'
+          | 'uncertain';
+        id?: string;
+        confirmedChars?: number;
+      }): Promise<void>;
+    };
+    signal?: AbortSignal;
   }): Promise<{ id: string; ids?: string[] }>;
   react?(input: {
     channelId: string;

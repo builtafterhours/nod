@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { SocketModeClient, LogLevel, UnrecoverableSocketModeStartError } from '@slack/socket-mode';
 import {
   WebClient,
@@ -6,16 +7,19 @@ import {
   WebAPIRequestError,
   WebAPIPlatformError,
   WebAPIRateLimitedError,
+  type ChatStopStreamArguments,
 } from '@slack/web-api';
 import { get as emojiForName, which as nameForEmoji } from 'node-emoji';
 import type { Pool } from 'pg';
 import { z } from 'zod';
+import { parseMarkdown } from 'chat';
 import type {
   InboundMessage,
   InboundReaction,
   MessagingAttachment,
   MessagingChannel,
   MessagingTransport,
+  MessagingControl,
 } from '../../ports/messaging.ts';
 import {
   MessagingAttachmentError,
@@ -28,6 +32,46 @@ import { slackMessages } from './format.ts';
 const id = /^[A-Z][A-Z0-9]{1,63}$/;
 const timestamp = /^\d{10,16}\.\d{6}$/;
 const fileLimit = 20 * 1024 * 1024;
+function streamFragments(text: string, limit: number) {
+  const parts: string[] = [];
+  for (let offset = 0; offset < text.length;) {
+    let end = Math.min(text.length, offset + limit);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+    parts.push(text.slice(offset, end));
+    offset = end;
+  }
+  return parts;
+}
+function streamMessages(text: string) {
+  if (text.length <= 9000) return [text];
+  if (text.length > 100_000) return;
+  const root = parseMarkdown(text);
+  const pending: Array<{ type: string; children?: unknown[] }> = [root];
+  while (pending.length) {
+    const node = pending.pop()!;
+    if (['definition', 'linkReference', 'imageReference'].includes(node.type)) return;
+    pending.push(...((node.children ?? []) as typeof pending));
+  }
+  const parts: string[] = [];
+  let current = '';
+  let offset = 0;
+  for (const node of root.children) {
+    const end = node.position?.end.offset;
+    if (end === undefined) return;
+    const source = text.slice(offset, end);
+    if (source.length > 9000) return;
+    if (current.length + source.length > 9000) {
+      parts.push(current);
+      current = '';
+    }
+    current += source;
+    offset = end;
+  }
+  const tail = text.slice(offset);
+  if (current.length + tail.length > 9000) return;
+  parts.push(current + tail);
+  return parts;
+}
 const emojiAliases: Record<string, string> = {
   thinking_face: 'thinking',
   hugging_face: 'hugs',
@@ -87,6 +131,7 @@ export const slackInput = z
       .string()
       .trim()
       .regex(/^[UW][A-Z0-9]{1,63}$/),
+    richEnabled: z.boolean().optional(),
   })
   .strict();
 
@@ -298,6 +343,7 @@ export async function verifySlack(input: unknown, request: typeof fetch = fetch)
         SLACK_APP_TOKEN: value.appToken,
         SLACK_TEAM_ID: value.teamId,
         SLACK_ALLOWED_USER_ID: value.allowedUserId,
+        SLACK_RICH_ENABLED: String(value.richEnabled === true),
       },
       summary: {
         provider: 'slack' as const,
@@ -306,6 +352,7 @@ export async function verifySlack(input: unknown, request: typeof fetch = fetch)
         allowedUserId: value.allowedUserId,
         accountName: `Workspace ${value.teamId}`,
         accountHandle: `Member ${value.allowedUserId}`,
+        richEnabled: value.richEnabled === true,
       },
     };
   } catch (error) {
@@ -379,6 +426,7 @@ export function createSlackTransport(
     appToken: environment.SLACK_APP_TOKEN,
     teamId: environment.SLACK_TEAM_ID,
     allowedUserId: environment.SLACK_ALLOWED_USER_ID,
+    richEnabled: environment.SLACK_RICH_ENABLED === 'true',
   });
   const enabled = environment.SLACK_ENABLED === 'true';
   const channel: MessagingChannel = {
@@ -394,6 +442,7 @@ export function createSlackTransport(
     allowedSenderIds: parsed.success ? [parsed.data.allowedUserId] : [],
     supportsAttachments: true,
     available: false,
+    rich: environment.SLACK_RICH_ENABLED === 'true',
   };
   const lifetime = new AbortController();
   const web = parsed.success ? client(parsed.data.botToken, lifetime.signal) : undefined;
@@ -405,6 +454,129 @@ export function createSlackTransport(
   let nextAttempt = 0;
   let terminal = false;
   let closed = false;
+  let acceptControl: ((input: MessagingControl) => Promise<void>) | undefined;
+  let controlCalls = 0;
+  let richReady: Promise<unknown> | undefined;
+  let streamUnsupported = false;
+  let statusUnsupported = false;
+  let cardsUnsupported = false;
+  let nextViewAt = 0;
+  const nextStreamCall = { start: 0, append: 0, stop: 0 };
+  async function pace(kind: keyof typeof nextStreamCall, signal: AbortSignal) {
+    const wait = Math.max(0, nextStreamCall[kind] - Date.now());
+    nextStreamCall[kind] = Date.now() + wait + (kind === 'append' ? 650 : 3100);
+    if (wait) await delay(wait, undefined, { signal });
+    signal.throwIfAborted();
+  }
+  const richTable = () =>
+    (richReady ??= pool
+      .query(
+        `
+    CREATE TABLE IF NOT EXISTS channel_slack_views (
+      installation text NOT NULL,session_id uuid NOT NULL,root_id text NOT NULL,provider_id text,state text NOT NULL,
+      PRIMARY KEY(installation,session_id,root_id));
+    CREATE TABLE IF NOT EXISTS channel_slack_reaction_names (
+      installation text NOT NULL,message_id text NOT NULL,name text NOT NULL,event_at numeric NOT NULL,
+      emoji text NOT NULL,present boolean NOT NULL,PRIMARY KEY(installation,message_id,name));
+    CREATE TABLE IF NOT EXISTS channel_slack_files (
+      installation text NOT NULL,message_id uuid NOT NULL,part integer NOT NULL,file_id text,state text NOT NULL,
+      provider_ids text[] NOT NULL DEFAULT '{}',PRIMARY KEY(installation,message_id,part));
+  `,
+      )
+      .catch((error) => {
+        richReady = undefined;
+        throw error;
+      }));
+  const installation = () =>
+    createHash('sha256')
+      .update(
+        `${channel.accountId}:${parsed.success ? parsed.data.allowedUserId : ''}:${verified?.appId}`,
+      )
+      .digest('hex');
+
+  async function control(type: string, body: unknown, ack: () => Promise<void>) {
+    if (!channel.rich || !acceptControl || closed || !verified || !parsed.success) return;
+    const basic = z
+      .object({
+        team_id: z.literal(parsed.data.teamId),
+        api_app_id: z.literal(verified.appId),
+        event_id: z.string().min(1).max(200),
+        event: z.object({
+          type: z.literal('agent_session_stopped'),
+          user: z.literal(parsed.data.allowedUserId),
+          channel: z.literal(verified.dmId),
+          thread_ts: z.string().regex(timestamp),
+          streaming_message_ts: z.array(z.string().regex(timestamp)).min(1).max(50),
+          event_ts: z.string().regex(timestamp),
+        }),
+      })
+      .safeParse(body);
+    let input: MessagingControl | undefined;
+    if (type === 'events_api' && basic.success) {
+      const ids = basic.data.event.streaming_message_ts.map((ts) => `${verified!.dmId}:${ts}`);
+      input = {
+        channelId: 'slack',
+        accountId: parsed.data.teamId,
+        senderId: parsed.data.allowedUserId,
+        threadId: verified.dmId,
+        eventId: basic.data.event_id,
+        rootMessageId: `${verified.dmId}:${basic.data.event.thread_ts}`,
+        action: 'stop',
+        streamIds: ids,
+      };
+    }
+    if (type === 'interactive') {
+      const action = z
+        .object({
+          type: z.literal('block_actions'),
+          api_app_id: z.literal(verified.appId),
+          team: z.object({ id: z.literal(parsed.data.teamId) }),
+          user: z.object({ id: z.literal(parsed.data.allowedUserId) }),
+          container: z.object({
+            type: z.literal('message'),
+            channel_id: z.literal(verified.dmId),
+            message_ts: z.string().regex(timestamp),
+          }),
+          actions: z
+            .array(
+              z.object({
+                action_id: z.enum(['nod_stop', 'nod_status']),
+                value: z.uuid(),
+                action_ts: z.string().regex(timestamp),
+              }),
+            )
+            .length(1),
+        })
+        .safeParse(body);
+      if (action.success) {
+        await richTable();
+        const message = `${verified.dmId}:${action.data.container.message_ts}`;
+        const view = (
+          await pool.query<{ root_id: string }>(
+            "SELECT root_id FROM channel_slack_views WHERE installation=$1 AND provider_id=$2 AND state='sent'",
+            [installation(), message],
+          )
+        ).rows[0];
+        const selected = action.data.actions[0];
+        if (view)
+          input = {
+            channelId: 'slack',
+            accountId: parsed.data.teamId,
+            senderId: parsed.data.allowedUserId,
+            threadId: verified.dmId,
+            eventId: `${message}:${selected.action_ts}:${selected.action_id}:${selected.value}`,
+            rootMessageId: view.root_id,
+            action: selected.action_id === 'nod_stop' ? 'stop' : 'status',
+            nonce: selected.value,
+            messageId: message,
+          };
+      }
+    }
+    if (input && !closed) {
+      await acceptControl(input);
+    }
+    await ack().catch(() => {});
+  }
   const incoming = new Map<
     string,
     { body: z.infer<typeof eventSchema>; ack: () => Promise<void> }
@@ -530,8 +702,25 @@ export function createSlackTransport(
             if (current()) report(new SlackIdentityError('Slack failed: app_identity_mismatch.'));
           });
           candidate.on('slack_event', ({ type, body, ack }) => {
-            const value = eventSchema.safeParse(body);
             if (!current() || terminal) return;
+            if (
+              channel.rich &&
+              (type === 'interactive' ||
+                z
+                  .object({ event: z.object({ type: z.literal('agent_session_stopped') }) })
+                  .safeParse(body).success)
+            ) {
+              if (controlCalls >= 8) return;
+              controlCalls++;
+              const pending = control(type, body, ack).catch(() => {});
+              active.add(pending);
+              void pending.finally(() => {
+                active.delete(pending);
+                controlCalls--;
+              });
+              return;
+            }
+            const value = eventSchema.safeParse(body);
             if (
               type !== 'events_api' ||
               !value.success ||
@@ -612,8 +801,289 @@ export function createSlackTransport(
     }
   }
 
+  async function streamReply(input: Parameters<MessagingTransport['post']>[0]) {
+    if (!input.stream || !input.rootMessageId) return;
+    const dm = target(input);
+    const root = messageId(input.rootMessageId);
+    const signal = AbortSignal.any([lifetime.signal, ...(input.signal ? [input.signal] : [])]);
+    const streamWeb = client(parsed.success ? parsed.data.botToken : '', signal);
+    const ids: string[] = [];
+    const claimedParts: number[] = [];
+    let openStreamId: string | undefined;
+    let stoppingStream = false;
+    if (!input.text) return;
+    const parts = streamMessages(input.text);
+    if (!parts) return;
+    const warning = (value: unknown) => {
+      const result = z
+        .object({
+          warning: z.string().optional(),
+          response_metadata: z.object({ warnings: z.array(z.string()).optional() }).optional(),
+        })
+        .parse(value);
+      for (const reason of [result.warning, ...(result.response_metadata?.warnings ?? [])].filter(
+        Boolean,
+      )) {
+        const code = /^[a-z_]{1,80}$/.test(reason!) ? reason : 'stream_response_warning';
+        if (code === 'missing_agent_session_stopped_event_subscription')
+          channel.richError = `Slack native Stop is unavailable: ${code}.`;
+        else throw new MessagingConnectionError(`Slack failed: ${code}.`);
+      }
+    };
+    try {
+      for (const [part, text] of parts.entries()) {
+        signal.throwIfAborted();
+        await input.stream.record({ part, state: 'starting' });
+        claimedParts.push(part);
+        let started;
+        try {
+          await pace('start', signal);
+          await input.stream.record({ part, state: 'dispatching' });
+          started = await streamWeb.chat.startStream({
+            channel: dm,
+            thread_ts: root,
+            chunks: [{ type: 'markdown_text', text: streamFragments(text, 3000)[0] }],
+          });
+        } catch (error) {
+          if (
+            !ids.length &&
+            error instanceof WebAPIPlatformError &&
+            [
+              'missing_scope',
+              'not_allowed_token_type',
+              'channel_type_not_supported',
+              'invalid_thread_ts',
+            ].includes(error.data.error)
+          ) {
+            streamUnsupported = true;
+            await input.stream.record({ part, state: 'uncertain' });
+            channel.richError = `Streaming unavailable. ${failure(error).message}`;
+            return;
+          }
+          throw error;
+        }
+        if (!started.ts || !timestamp.test(started.ts))
+          throw new MessagingConnectionError('Slack failed: stream_receipt_unavailable.');
+        const providerId = `${dm}:${started.ts}`;
+        openStreamId = providerId;
+        ids.push(providerId);
+        const fragments = streamFragments(text, 3000);
+        let confirmedChars = fragments[0].length;
+        await input.stream.record({ part, state: 'open', id: providerId, confirmedChars });
+        warning(started);
+        const deadline = Date.now() + 8 * 60_000;
+        for (const fragment of fragments.slice(1)) {
+          signal.throwIfAborted();
+          if (Date.now() > deadline)
+            throw new MessagingConnectionError('Slack failed: stream_deadline_exceeded.');
+          await pace('append', signal);
+          await input.stream.record({ part, state: 'appending' });
+          const appended = await streamWeb.chat.appendStream({
+            channel: dm,
+            ts: started.ts,
+            chunks: [{ type: 'markdown_text', text: fragment }],
+          });
+          warning(appended);
+          confirmedChars += fragment.length;
+          await input.stream.record({ part, state: 'open', id: providerId, confirmedChars });
+        }
+        signal.throwIfAborted();
+        await pace('stop', signal);
+        await input.stream.record({ part, state: 'finalizing' });
+        stoppingStream = true;
+        const stopped = await streamWeb.chat.stopStream({
+          channel: dm,
+          ts: started.ts,
+          session_status: part < parts.length - 1 ? 'processing' : 'active',
+        });
+        openStreamId = undefined;
+        warning(stopped);
+        await input.stream.record({ part, state: 'finalized', id: providerId, confirmedChars });
+        stoppingStream = false;
+      }
+      return { id: ids[0] ?? '', ids };
+    } catch (error) {
+      const hold = Date.now() + retryAfter(error);
+      for (const kind of ['start', 'append', 'stop'] as const)
+        nextStreamCall[kind] = Math.max(nextStreamCall[kind], hold);
+      for (const part of claimedParts)
+        await input.stream.record({ part, state: 'uncertain' }).catch(() => {});
+      if (openStreamId && !stoppingStream) {
+        const cleanup = client(
+          parsed.success ? parsed.data.botToken : '',
+          AbortSignal.any([lifetime.signal, AbortSignal.timeout(3000)]),
+        );
+        await cleanup.chat
+          .stopStream({ channel: dm, ts: messageId(openStreamId), session_status: 'active' })
+          .catch(() => {});
+      }
+      throw new MessagingDeliveryError(failure(error).message, ids);
+    }
+  }
+
   return {
     channels: [channel],
+    controls(accept) {
+      acceptControl = accept;
+      return () => {
+        if (acceptControl === accept) acceptControl = undefined;
+      };
+    },
+    async conversation(input) {
+      try {
+        if (!channel.rich) return {};
+        const dm = target(input);
+        const root = messageId(input.rootMessageId);
+        const signal = AbortSignal.any([lifetime.signal, input.signal]);
+        signal.throwIfAborted();
+        const viewWeb = client(parsed.success ? parsed.data.botToken : '', signal);
+        const wait = Math.max(0, nextViewAt - Date.now());
+        nextViewAt = Date.now() + wait + 1300;
+        if (wait) await delay(wait, undefined, { signal });
+        await richTable();
+        if (!statusUnsupported) {
+          try {
+            const status = await viewWeb.agents.sessions.setStatus({
+              channel_id: dm,
+              thread_ts: root,
+              status: input.status,
+              title: input.title,
+              initiator_user_id: parsed.success ? parsed.data.allowedUserId : undefined,
+            });
+            if (status.warning === 'missing_agent_session_stopped_event_subscription')
+              channel.richError =
+                'Slack native Stop is unavailable: missing_agent_session_stopped_event_subscription.';
+          } catch (error) {
+            if (
+              error instanceof WebAPIPlatformError &&
+              ['missing_scope', 'feature_disabled'].includes(error.data.error)
+            ) {
+              statusUnsupported = true;
+              channel.richError = `Native status unavailable. ${failure(error).message}`;
+            } else throw failure(error);
+          }
+        }
+        const key = installation();
+        const previous = (
+          await pool.query<{ provider_id: string | null; state: string }>(
+            'SELECT provider_id,state FROM channel_slack_views WHERE installation=$1 AND session_id=$2 AND root_id=$3',
+            [key, input.sessionId, input.rootMessageId],
+          )
+        ).rows[0];
+        if (previous && previous.state !== 'sent') return {};
+        const text = [
+          input.title,
+          input.outcome === 'failed'
+            ? 'Failed'
+            : input.outcome === 'cancelled'
+              ? 'Stopped'
+              : input.status === 'processing'
+                ? 'Working'
+                : input.status === 'suspended'
+                  ? 'Needs you'
+                  : input.status === 'closed'
+                    ? 'Closed'
+                    : 'Ready',
+          input.text,
+          ...(input.task?.steps ?? []).map((title, index) => `${index + 1}. ${title}`),
+        ]
+          .filter(Boolean)
+          .join('\n');
+        const blocks: NonNullable<ChatStopStreamArguments['blocks']> = [
+          { type: 'section', text: { type: 'plain_text', text: text.slice(0, 2900) } },
+        ];
+        if (input.task && !cardsUnsupported) {
+          const status = input.outcome
+            ? 'error'
+            : input.task.state === 'done'
+              ? 'complete'
+              : input.task.state === 'open'
+                ? 'in_progress'
+                : 'error';
+          blocks.push({
+            type: 'task_card',
+            task_id: 'task',
+            title: input.title,
+            status,
+          });
+        }
+        if (input.control)
+          blocks.push({
+            type: 'actions',
+            elements: [
+              {
+                type: 'button',
+                text: { type: 'plain_text', text: 'Stop' },
+                action_id: 'nod_stop',
+                value: input.control.stop,
+              },
+              {
+                type: 'button',
+                text: { type: 'plain_text', text: 'Status' },
+                action_id: 'nod_status',
+                value: input.control.status,
+              },
+            ],
+          });
+        const render = async () => {
+          const send = () => {
+            if (previous?.provider_id) {
+              return viewWeb.chat.update({
+                channel: dm,
+                ts: messageId(previous.provider_id),
+                text,
+                blocks,
+              });
+            }
+            return viewWeb.chat.postMessage({
+              channel: dm,
+              thread_ts: root,
+              text,
+              blocks,
+              unfurl_links: false,
+              unfurl_media: false,
+            });
+          };
+          try {
+            return await send();
+          } catch (error) {
+            const card = blocks.findIndex((block) => block.type === 'task_card');
+            if (
+              !(error instanceof WebAPIPlatformError) ||
+              error.data.error !== 'invalid_blocks' ||
+              card < 0
+            )
+              throw error;
+            cardsUnsupported = true;
+            channel.richError = 'Slack task cards unavailable: invalid_blocks.';
+            blocks.splice(card, 1);
+            return send();
+          }
+        };
+        if (previous?.provider_id) {
+          await render();
+          return { id: previous.provider_id };
+        }
+        const claim = await pool.query(
+          "INSERT INTO channel_slack_views(installation,session_id,root_id,state) VALUES($1,$2,$3,'sending') ON CONFLICT DO NOTHING RETURNING session_id",
+          [key, input.sessionId, input.rootMessageId],
+        );
+        if (!claim.rowCount) return {};
+        const sent = await render();
+        if (!sent.ts || !timestamp.test(sent.ts))
+          throw new MessagingConnectionError('Slack failed: control_receipt_unavailable.');
+        const providerId = `${dm}:${sent.ts}`;
+        await pool.query(
+          "UPDATE channel_slack_views SET state='sent',provider_id=$3 WHERE installation=$1 AND session_id=$2 AND root_id=$4",
+          [key, input.sessionId, providerId, input.rootMessageId],
+        );
+        return { id: providerId };
+      } catch (error) {
+        nextViewAt = Math.max(nextViewAt, Date.now() + retryAfter(error));
+        channel.richError = failure(error).message;
+        throw failure(error);
+      }
+    },
     async poll(accept, _pair, react) {
       if (!enabled || !parsed.success || closed) return;
       start();
@@ -649,6 +1119,42 @@ export function createSlackTransport(
         } else if (react && event.item?.type === 'message' && event.reaction && event.event_ts) {
           const emoji = reactionEmoji(event.reaction);
           if (isMessageReaction(emoji)) {
+            if (channel.rich) {
+              await richTable();
+              const targetId = `${verified!.dmId}:${event.item.ts}`;
+              const claimed = await pool.query(
+                `INSERT INTO channel_slack_reaction_names(installation,message_id,name,event_at,emoji,present) VALUES($1,$2,$3,$4,$5,$6)
+                ON CONFLICT(installation,message_id,name) DO UPDATE SET event_at=EXCLUDED.event_at,present=EXCLUDED.present
+                WHERE channel_slack_reaction_names.event_at<EXCLUDED.event_at RETURNING name`,
+                [
+                  installation(),
+                  targetId,
+                  event.reaction,
+                  event.event_ts,
+                  emoji,
+                  event.type === 'reaction_added',
+                ],
+              );
+              if (claimed.rowCount) {
+                const latest = (
+                  await pool.query<{ emoji: string }>(
+                    'SELECT emoji FROM channel_slack_reaction_names WHERE installation=$1 AND message_id=$2 AND present ORDER BY event_at DESC,name LIMIT 1',
+                    [installation(), targetId],
+                  )
+                ).rows[0];
+                await react({
+                  channelId: 'slack',
+                  accountId: parsed.data.teamId,
+                  senderId: parsed.data.allowedUserId,
+                  messageId: targetId,
+                  reaction: latest?.emoji ?? null,
+                  displayOnly: event.type === 'reaction_removed' || latest?.emoji !== emoji,
+                });
+              }
+              await item.ack().catch(() => {});
+              incoming.delete(key);
+              continue;
+            }
             await table();
             const targetId = `${verified!.dmId}:${event.item.ts}`;
             const claimed = await pool.query(
@@ -689,15 +1195,28 @@ export function createSlackTransport(
     async post(input) {
       const dm = target(input);
       if (input.replyToMessageId) messageId(input.replyToMessageId);
+      if (input.rootMessageId) messageId(input.rootMessageId);
+      input.signal?.throwIfAborted();
+      const sendSignal = AbortSignal.any([
+        lifetime.signal,
+        ...(input.signal ? [input.signal] : []),
+      ]);
+      const postWeb = client(parsed.success ? parsed.data.botToken : '', sendSignal);
+      if (channel.rich && input.stream && !streamUnsupported) {
+        const result = await streamReply(input);
+        if (result) return result;
+      }
       const ids: string[] = [];
       try {
         const parts = slackMessages(
           input.text || input.attachments?.map((file) => file.name).join('\n') || '',
         );
         for (const text of parts) {
+          sendSignal.throwIfAborted();
           const result = await operation(() =>
-            web!.chat.postMessage({
+            postWeb.chat.postMessage({
               channel: dm,
+              ...(input.rootMessageId ? { thread_ts: messageId(input.rootMessageId) } : {}),
               text,
               unfurl_links: false,
               unfurl_media: false,
@@ -711,58 +1230,111 @@ export function createSlackTransport(
         }
         const unsent: string[] = [];
         let uncertain: MessagingConnectionError | undefined;
-        for (const file of input.attachments ?? []) {
+        for (const [part, file] of (input.attachments ?? []).entries()) {
           let bytes: Uint8Array;
           try {
             if (!file.size || file.size > fileLimit) throw new MessagingAttachmentError(fileLimit);
-            bytes = await file.read(lifetime.signal);
+            bytes = await file.read(sendSignal);
             if (bytes.length !== file.size || bytes.length > fileLimit)
               throw new MessagingAttachmentError(fileLimit);
           } catch {
             unsent.push(file.name);
             continue;
           }
+          let fileClaim = false;
+          const recordFile = channel.rich && input.deliveryId;
           try {
+            if (recordFile) {
+              await richTable();
+              const claimed = await pool.query(
+                "INSERT INTO channel_slack_files(installation,message_id,part,state) VALUES($1,$2,$3,'preparing') ON CONFLICT DO NOTHING RETURNING part",
+                [installation(), input.deliveryId, part],
+              );
+              if (!claimed.rowCount)
+                throw new MessagingConnectionError('Slack failed: file_delivery_already_claimed.');
+              fileClaim = true;
+            }
             const upload = await operation(() =>
-              web!.files.getUploadURLExternal({ filename: file.name, length: bytes.length }),
+              postWeb.files.getUploadURLExternal({ filename: file.name, length: bytes.length }),
             );
             if (!upload.file_id)
               throw new MessagingConnectionError('Slack failed: upload_receipt_unavailable.');
+            if (fileClaim)
+              await pool.query(
+                "UPDATE channel_slack_files SET file_id=$4,state='uploading' WHERE installation=$1 AND message_id=$2 AND part=$3",
+                [installation(), input.deliveryId, part, upload.file_id],
+              );
             const response = await operation(() =>
               fetch(fileUrl(upload.upload_url, true), {
                 method: 'POST',
                 body: Buffer.from(bytes),
                 redirect: 'error',
-                signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(60_000)]),
+                signal: AbortSignal.any([sendSignal, AbortSignal.timeout(60_000)]),
               }),
             );
             if (!response.ok)
               throw new MessagingConnectionError(
                 `Slack file upload failed: HTTP ${response.status}.`,
               );
+            if (fileClaim)
+              await pool.query(
+                "UPDATE channel_slack_files SET state='completing' WHERE installation=$1 AND message_id=$2 AND part=$3",
+                [installation(), input.deliveryId, part],
+              );
             await operation(() =>
-              web!.files.completeUploadExternal({
+              postWeb.files.completeUploadExternal({
                 files: [{ id: upload.file_id!, title: file.name }],
                 channel_id: dm,
+                ...(input.rootMessageId ? { thread_ts: messageId(input.rootMessageId) } : {}),
               }),
             );
-            const shared = await operation(() => web!.files.info({ file: upload.file_id! }));
+            const shared = await operation(() => postWeb.files.info({ file: upload.file_id! }));
             const shares = z
               .object({
                 shares: z
                   .object({
                     private: z
-                      .record(z.string(), z.array(z.object({ ts: z.string().regex(timestamp) })))
+                      .record(
+                        z.string(),
+                        z.array(
+                          z.object({
+                            ts: z.string().regex(timestamp),
+                            thread_ts: z.string().regex(timestamp).optional(),
+                          }),
+                        ),
+                      )
                       .optional(),
                   })
                   .optional(),
               })
               .safeParse(shared.file);
-            const receipts = shares.success ? (shares.data.shares?.private?.[dm] ?? []) : [];
+            const receipts = shares.success
+              ? (shares.data.shares?.private?.[dm] ?? []).filter(
+                  (share) =>
+                    !input.rootMessageId || share.thread_ts === messageId(input.rootMessageId),
+                )
+              : [];
             if (!receipts.length)
               throw new MessagingConnectionError('Slack failed: file_message_receipt_unavailable.');
             for (const share of receipts) ids.push(`${dm}:${share.ts}`);
+            if (fileClaim)
+              await pool.query(
+                "UPDATE channel_slack_files SET state='confirmed',provider_ids=$4 WHERE installation=$1 AND message_id=$2 AND part=$3",
+                [
+                  installation(),
+                  input.deliveryId,
+                  part,
+                  receipts.map((share) => `${dm}:${share.ts}`),
+                ],
+              );
           } catch (error) {
+            if (fileClaim)
+              await pool
+                .query(
+                  "UPDATE channel_slack_files SET state='uncertain' WHERE installation=$1 AND message_id=$2 AND part=$3 AND state<>'confirmed'",
+                  [installation(), input.deliveryId, part],
+                )
+                .catch(() => {});
             uncertain ??= failure(error);
             if (closed) throw uncertain;
           }
@@ -772,8 +1344,9 @@ export function createSlackTransport(
           if (!notice) throw new MessagingConnectionError('Slack failed: attachment_unavailable.');
           for (const text of slackMessages(notice)) {
             const sent = await operation(() =>
-              web!.chat.postMessage({
+              postWeb.chat.postMessage({
                 channel: dm,
+                ...(input.rootMessageId ? { thread_ts: messageId(input.rootMessageId) } : {}),
                 text,
                 unfurl_links: false,
                 unfurl_media: false,

@@ -965,6 +965,25 @@ export function createTasks(options: {
   }
 
   return {
+    async channelControl(
+      client: PoolClient,
+      target: { threadId: string; sessionId: string; turnId: string; channel: string },
+    ) {
+      const thread = await lockThread(client);
+      if (thread.id !== target.threadId) throw failure('The conversation has changed.');
+      const cancelled = await cancelTurns(
+        client,
+        thread.id,
+        {
+          sessionId: target.sessionId,
+          expectedTurnId: target.turnId,
+          channel: target.channel,
+        },
+        snapshotAnalytics(options.analytics),
+        'owner',
+      );
+      return () => afterStop(cancelled);
+    },
     initialize,
     execute,
     setModel,

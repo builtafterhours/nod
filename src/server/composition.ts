@@ -158,7 +158,7 @@ import { connectedGmail } from '../shared/onboarding.ts';
 import { createPostgresObjectStore } from './object-storage.ts';
 import { loadPrivacyNoticeFile, registerPrivacyNotice } from './privacy.ts';
 import { createDocumentation } from './documentation.ts';
-import { initializeDatabase, pool } from './db.ts';
+import { cancellationTransaction, initializeDatabase, pool } from './db.ts';
 import { events, refresh } from './events.ts';
 import { createIntegrations } from './integrations.ts';
 import { gmailDraftTarget, gmailMessageTarget } from './action-presentation.ts';
@@ -3023,6 +3023,8 @@ async function initializeApplication(
       ? setup.create(await channelSettings!.environment())
       : adapters.messaging!;
     channels = await createChannels(pool, {
+      control: tasks.channelControl,
+      cancel: (work) => cancellationTransaction(work, pool),
       admission,
       ownerId,
       present: communication.present,
@@ -3037,7 +3039,7 @@ async function initializeApplication(
       classifyRetiredReply: (reply, expired) =>
         ledger.forOwner(() => trust.classifyRetiredReply(reply, expired)),
       acceptVerification: (text, input) => chatVerification.accept(text, input),
-      reacted: (messageId, reaction) => reactToMessage(messageId, reaction),
+      reacted: (messageId, reaction, wake) => reactToMessage(messageId, reaction, wake),
       activeThread: (client) => lockThread(client),
       activity: activity.read,
       taskCommand: tasks.chatCommand,

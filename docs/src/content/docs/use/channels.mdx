@@ -119,6 +119,8 @@ Open **Manage Slack** to reconnect, update the connection, or disconnect. Discon
 
 Every Nod message arrives at the top level of the DM, not as a child in a Slack thread. To answer a question or continue a task, open the thread on that exact Nod message. Slack sends the root message, not a selected child, as the reply target. Unknown thread roots cannot answer a different question. A thumbs-up or thumbs-down reaction on a confirmation answers that exact action. Removing it does not undo an action.
 
+This is the default connection. With **Rich Slack**, ordinary replies and task files use session threads. Approval questions still arrive separately at the top level: answer in that exact question's thread, or react to that exact question. A task thread does not select a child approval question. Partially or uncertainly delivered Slack questions cannot approve an action. An unaddressed DM reply cannot approve one either.
+
 Use these as ordinary DM text, not workspace slash commands:
 
 | Send                                    | To get                                         |
@@ -136,13 +138,69 @@ Slack supports text, links, images, documents, video, and audio files, including
 
 Slack has no generic bot typing indicator. Queued messages get Nod's eyes reaction until they are read. Useful progress and results arrive as ordinary messages. Standard reactions supported by Nod's channel emoji library work in both directions; custom workspace emoji and unsupported emoji are ignored. Sign-in, payments, and browser handoffs still finish privately in Nod.
 
+Slack does offer native agent progress. Enable the optional setup below to use it; absence of a generic typing method does not mean native agent status is unavailable.
+
 Slack lets you leave several reactions on one message. Nod tracks only your latest supported reaction; removing it clears Nod's reaction state, even if another remains visible. Removal never reverses an action.
+
+With rich mode, Nod tracks supported reactions separately. Removing one shows your most recently added remaining reaction. This display change never approves or repeats an action. Custom emoji have no inferred meaning. Reactions missed during an outage are not reconstructed from history.
 
 If Slack supplies incomplete file metadata, Nod reports an attachment failure instead of silently ignoring your message. Resend the text without the file to continue. Media preparation finishes before Nod acknowledges intake, so Slack can redeliver slow uploads. Saved messages are deduplicated.
 
 After a connection interruption, Nod keeps trying while Slack is configured, with failure waits increasing from two to 30 seconds. Slack's retry-after delay can extend a wait to five minutes. Connection recovery runs in the background without holding up other channels. An explicit authentication, identity, or configuration failure stops recovery until you select **Manage Slack → Reconnect**. Slack can replay recent events; Nod deduplicates saved messages and fences reaction replays. Nod does not fetch old DM history after a restart. If no reply arrives, send a new message. A message or file whose delivery is uncertain is never automatically sent again. Check Slack before asking for another attempt.
 
 Long replies are packed into bounded messages by block, table row, or list item. Table rows retain their original column labels, and ordered lists keep their numbering. Oversized blocks split without breaking code fences, links, or escaped characters; a link too long for one part becomes plain text. A missing file message receipt leaves delivery uncertain. Nod keeps confirmed text and file targets and continues the remaining attachments without uploading any file twice.
+
+### Rich Slack
+
+Rich mode is optional and off by default. It uses [Agent Sessions](https://docs.slack.dev/ai/agent-sessions/) in your verified DM, not a second Nod conversation. Saved tasks keep their own Slack threads. Status reflects working, waiting for you, ready, or closed; closing a stream does not mean a task succeeded.
+
+1. In your Slack app settings, declare the app as an agent with **Agent messaging experience** (`agent_view`). Add `assistant:write` alongside the scopes above. Some AI features require a paid Slack plan; settings alone do not prove availability.
+2. Subscribe to `agent_session_stopped` alongside the three existing bot events. Enable **Interactivity**. Keep Socket Mode enabled; no public request URL or slash commands are needed.
+3. Apply the new permissions in Slack, then select **Channels → Manage Slack → Update connection**. Enter the credentials and select **Rich Slack (requires agent setup)**. For a managed connection, set `SLACK_RICH_ENABLED=true` and apply your configuration.
+
+Switching an older `assistant_view` app to `agent_view` is irreversible. Nod does not change your Slack installation for you. **Reconnect** verifies identity again; it does not grant new scopes. Manage shows that rich mode was requested, and reports supported fallback errors without exposing credentials.
+
+This manifest fragment supplements your app's existing identity and permissions:
+
+```yaml
+features:
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  agent_view:
+    agent_description: Chat with Nod in your private direct message
+oauth_config:
+  scopes:
+    bot:
+      - assistant:write
+      - chat:write
+      - im:write
+      - im:read
+      - im:history
+      - users:read
+      - reactions:read
+      - reactions:write
+      - files:read
+      - files:write
+settings:
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: true
+  event_subscriptions:
+    bot_events:
+      - message.im
+      - reaction_added
+      - reaction_removed
+      - agent_session_stopped
+```
+
+Ordinary replies stream only after Nod has saved and privacy-checked the reply. This is buffered delivery, not live model-token streaming. Long replies roll over at complete Markdown block boundaries; oversized single blocks and cross-message Markdown references use ordinary split messages. A definite unsupported-stream rejection falls back to ordinary delivery. An ambiguous stream failure never resends content: partial text can remain in Slack, while the saved reply remains in Nod. Private steps and approval questions never stream.
+
+While a turn is running, its task controls offer **Stop** and **Status**. Each control is bound to that owner, account, thread, session, and exact turn. Old controls cannot stop later work or work in another channel. Native Slack Stop can cancel Nod only when its event names a still-open stream belonging to that exact active turn. Because buffered delivery usually follows model work, native Stop rarely has that binding. Empty or stale stream lists do not cancel Nod; use the current task's **Stop** control instead. Slack may stop rendering a partial stream without cancelling Nod.
+
+Controls expire after 15 minutes and renew while the same work is running. Disconnect invalidates them without cancelling work in other channels. A processing indicator can remain in Slack until Slack's timeout or a verified refresh clears it. Nod doesn't use removed credentials to update it.
+
+Task cards show saved task state alongside the current activity and planned steps. Nod does not mark individual planned steps complete without evidence. Waiting is not success. Media uses Slack-hosted file uploads in the task thread; outgoing audio is a file, not a claimed native recording. A threaded file receipt without a verified parent remains uncertain. Unsupported cards, workspace policies, missing scopes, and client behavior can reduce native affordances; ordinary messages and private Nod controls remain available.
 
 :::caution[Slack acceptance]
 This channel has not yet been accepted against an owner-authorized Slack test workspace. Workspace policy, mobile audio, file receipts, and reconnect behavior still need that check.

@@ -105,6 +105,7 @@ export function channelConnectionObservations(
 }
 
 const summarySchema = z.object({
+  richEnabled: z.boolean().optional(),
   provider: providerSchema,
   enabled: z.boolean(),
   managed: z.boolean().optional(),
@@ -162,6 +163,7 @@ type TelegramPairingCandidate = z.infer<typeof candidateSchema>;
 const pairingLifetimeMs = 15 * 60 * 1000;
 const fields: Record<ChannelProvider, Set<string>> = {
   slack: new Set([
+    'SLACK_RICH_ENABLED',
     'SLACK_ENABLED',
     'SLACK_BOT_TOKEN',
     'SLACK_APP_TOKEN',
@@ -205,6 +207,11 @@ export function managedChannelEnvironment(environment: Record<string, string | u
         throw new Error(`${name} must be true, false or empty.`);
     values[enabled] ??= 'true';
     if (provider === 'slack') {
+      if (
+        values.SLACK_RICH_ENABLED !== undefined &&
+        !['true', 'false'].includes(values.SLACK_RICH_ENABLED)
+      )
+        throw new Error('SLACK_RICH_ENABLED must be true, false or empty.');
       managed[provider] = values;
       continue;
     }
@@ -432,6 +439,7 @@ export async function createChannelSettings(
         provider,
         enabled: values[`${provider.toUpperCase()}_ENABLED`] === 'true',
         managed: true,
+        ...(provider === 'slack' ? { richEnabled: values.SLACK_RICH_ENABLED === 'true' } : {}),
         mode:
           provider === 'slack'
             ? 'socket'

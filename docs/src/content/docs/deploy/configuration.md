@@ -150,6 +150,7 @@ Set `TELEGRAM_ENABLED=false`, `WHATSAPP_ENABLED=false`, or `SLACK_ENABLED=false`
 | `WHATSAPP_VERIFY_TOKEN`         | The token Meta sends when it verifies the webhook.                                                                               | Empty                                   |
 | `WHATSAPP_ALLOWED_NUMBER`       | Your personal number, with country code, 7 to 15 digits. Required for `bot` and Cloud API. Self-chat uses the linked number.     | Empty                                   |
 | `SLACK_ENABLED`                 | `true` enables Slack; `false` disables it. Either value makes it server-managed.                                                 | Unset; follows supplied configuration   |
+| `SLACK_RICH_ENABLED`            | Requests agent status, task threads, controls, and buffered reply streams after [rich Slack setup](/use/channels/#rich-slack).   | `false`                                 |
 | `SLACK_BOT_TOKEN`               | Your app's `xoxb-` bot token.                                                                                                    | Empty                                   |
 | `SLACK_APP_TOKEN`               | The same app's `xapp-` app-level token with `connections:write`.                                                                 | Empty                                   |
 | `SLACK_TEAM_ID`                 | The only workspace Nod accepts, beginning with `T`.                                                                              | Empty                                   |
