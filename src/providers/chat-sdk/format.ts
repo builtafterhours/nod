@@ -1,5 +1,4 @@
 import { parseMarkdown, type Root } from 'chat';
-import { MessagingConnectionError } from '../../ports/messaging.ts';
 
 type Node = Root | Root['children'][number];
 type Parent = Extract<Node, { children: unknown }>;
@@ -62,7 +61,7 @@ function prose(value: string, syntax: Syntax) {
   return result + syntax.text(value.slice(last));
 }
 
-function render(root: Root, syntax: Syntax, source?: string) {
+function render(root: Root, syntax: Syntax, source?: string, units?: string[]) {
   const inline = (nodes: Node[], open: ReadonlySet<string>) =>
     nodes.map((node) => phrase(node, open)).join('');
 
@@ -141,20 +140,21 @@ function render(root: Root, syntax: Syntax, source?: string) {
             `${syntax.quote}${line.startsWith(syntax.quote) ? line.slice(syntax.quote.length) : line}`.trimEnd(),
           )
           .join('\n');
-      case 'list':
-        return node.children
-          .map((item, index) => {
-            const box = item.checked === true ? '☑' : item.checked === false ? '☐' : '';
-            const marker = node.ordered
-              ? `${syntax.number((node.start ?? 1) + index)}${box && ` ${box}`}`
-              : box || syntax.bullet;
-            const content = blocks(item.children, item.spread ? '\n\n' : '\n')
-              .split('\n')
-              .map((line, position) => (position && line ? `  ${line}` : line))
-              .join('\n');
-            return `${marker} ${content}`;
-          })
-          .join('\n');
+      case 'list': {
+        const items = node.children.map((item, index) => {
+          const box = item.checked === true ? '☑' : item.checked === false ? '☐' : '';
+          const marker = node.ordered
+            ? `${syntax.number((node.start ?? 1) + index)}${box && ` ${box}`}`
+            : box || syntax.bullet;
+          const content = blocks(item.children, item.spread ? '\n\n' : '\n')
+            .split('\n')
+            .map((line, position) => (position && line ? `  ${line}` : line))
+            .join('\n');
+          return `${marker} ${content}`;
+        });
+        if (units && root.children[0] === node) for (const item of items) units.push(item);
+        return items.join('\n');
+      }
       case 'table': {
         const [head, ...rows] = node.children.map((row) => row.children);
         if (!head) return '';
@@ -165,20 +165,20 @@ function render(root: Root, syntax: Syntax, source?: string) {
             .filter(Boolean)
             .map((cell) => `${syntax.bullet} ${cell}`)
             .join('\n');
-        return rows
-          .map((row) =>
-            [
-              row[0] && mark(syntax.bold, row[0], none).trim(),
-              ...row.slice(1).map((cell, index) => {
-                const value = inline(cell.children, none).trim();
-                const label = labels[index + 1];
-                return value && `${syntax.bullet} ${label ? `${label}: ` : ''}${value}`;
-              }),
-            ]
-              .filter(Boolean)
-              .join('\n'),
-          )
-          .join('\n\n');
+        const items = rows.map((row) =>
+          [
+            row[0] && mark(syntax.bold, row[0], none).trim(),
+            ...row.slice(1).map((cell, index) => {
+              const value = inline(cell.children, none).trim();
+              const label = labels[index + 1];
+              return value && `${syntax.bullet} ${label ? `${label}: ` : ''}${value}`;
+            }),
+          ]
+            .filter(Boolean)
+            .join('\n'),
+        );
+        if (units && root.children[0] === node) for (const item of items) units.push(item);
+        return items.join('\n\n');
       }
       case 'definition':
         return '';
@@ -202,91 +202,78 @@ export function whatsappText(markdown: string) {
   return render(parseMarkdown(markdown), whatsapp, markdown);
 }
 
+const slackEscape = (value: string) =>
+  value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const slack: Syntax = {
+  ...whatsapp,
+  text: slackEscape,
+  code: (value) => `\`${slackEscape(value).replaceAll('`', "'")}\``,
+  block: (value) => `\`\`\`\n${slackEscape(value).replaceAll('```', "'''")}\n\`\`\``,
+  link: (label, url) =>
+    `<${slackEscape(url).replaceAll('|', '%7C')}|${label.replaceAll('|', ' ')}>`,
+};
+
 export function slackText(markdown: string | Root) {
-  const escape = (value: string) =>
-    value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
   return render(
     typeof markdown === 'string' ? parseMarkdown(markdown) : markdown,
-    {
-      ...whatsapp,
-      text: escape,
-      code: (value) => `\`${escape(value).replaceAll('`', "'")}\``,
-      block: (value) => `\`\`\`\n${escape(value).replaceAll('```', "'''")}\n\`\`\``,
-      link: (label, url) => `<${escape(url).replaceAll('|', '%7C')}|${label.replaceAll('|', ' ')}>`,
-    },
+    slack,
     typeof markdown === 'string' ? markdown : undefined,
   );
 }
 
 export function slackMessages(markdown: string) {
   const limit = 3000;
-  const text = slackText(markdown);
-  if (text.length <= limit) return text ? [text] : [];
   const root = parseMarkdown(markdown);
-  const split = (node: Node, wrap: (part: Node) => Root): Node[] => {
-    const length = (part: Node) => slackText(wrap(part)).length;
-    if (length(node) <= limit) return [node];
-    if (
-      node.type === 'image' ||
-      (node.type === 'link' && length({ ...node, children: [] }) > limit - 100)
-    ) {
-      const label = node.type === 'image' ? node.alt || 'Image' : plain(node);
-      return split(
-        {
-          type: 'text',
-          value: [label, `mailto:${label}`].includes(node.url) ? label : `${label} (${node.url})`,
-        } as Node,
-        wrap,
-      );
-    }
-    if ('children' in node) {
-      const parts: Node[] = [];
-      let children: Node[] = [];
-      const withChildren = (values: Node[]) => ({ ...node, children: values }) as Node;
-      for (const child of node.children as Node[]) {
-        for (const part of split(child, (value) => wrap(withChildren([value])))) {
-          if (children.length && length(withChildren([...children, part])) > limit) {
-            parts.push(withChildren(children));
-            children = [];
-          }
-          children.push(part);
-        }
-      }
-      if (children.length) parts.push(withChildren(children));
-      return parts;
-    }
-    if ('value' in node && typeof node.value === 'string') {
-      const points = Array.from(node.value);
-      const parts: Node[] = [];
-      let offset = 0;
-      while (offset < points.length) {
-        const part = (count: number) =>
-          ({
-            ...node,
-            value: points.slice(offset, offset + count).join(''),
-          }) as Node;
-        let low = 0;
-        let high = Math.min(points.length - offset, limit);
-        while (low < high) {
-          const mid = Math.ceil((low + high) / 2);
-          if (length(part(mid)) <= limit) low = mid;
-          else high = mid - 1;
-        }
-        if (!low) throw new MessagingConnectionError('Slack failed: text_format_limit.');
-        if (offset + low < points.length) {
-          const candidate = points.slice(offset, offset + low);
-          let boundary = candidate.lastIndexOf('\n');
-          if (boundary < low / 2) boundary = candidate.lastIndexOf(' ');
-          if (boundary >= low / 2) low = boundary + 1;
-        }
-        parts.push(part(low));
-        offset += low;
-      }
-      return parts;
-    }
-    throw new MessagingConnectionError('Slack failed: text_format_limit.');
+  const parts: string[] = [];
+  let current = '';
+  const flush = () => {
+    if (current) parts.push(current);
+    current = '';
   };
-  return split(root, (part) => part as Root)
-    .map((part) => slackText(part as Root))
-    .filter(Boolean);
+  const pack = (text: string, separator: string) => {
+    if (!text) return;
+    if (current.length + separator.length + text.length > limit) flush();
+    current += (current ? separator : '') + text;
+  };
+  const leaf = (text: string) => {
+    flush();
+    let code = '';
+    let chunk = '';
+    const close = () => (code === '```' ? '\n```' : code);
+    const append = (token: string) => {
+      const next = token === code ? '' : !code && /^`(?:``)?$/.test(token) ? token : code;
+      const suffix = next === '```' ? '\n```' : next;
+      if (chunk.length + token.length + suffix.length > limit) {
+        parts.push(chunk + close());
+        chunk = code === '```' ? '```\n' : code;
+      }
+      chunk += token;
+      code = next;
+    };
+    for (const match of text.matchAll(/```|`|<[^>]*>|&(?:amp|lt|gt);|[\s\S]/gu)) {
+      const token = match[0];
+      if (token.length <= limit - 8) append(token);
+      else {
+        const divider = token.indexOf('|');
+        const value = `${token.slice(divider + 1, -1)} (${token.slice(1, divider)})`;
+        for (const point of value.matchAll(/```|`|&(?:amp|lt|gt);|[\s\S]/gu)) append(point[0]);
+      }
+    }
+    if (chunk) parts.push(chunk + close());
+  };
+  for (const node of root.children) {
+    const units: string[] = [];
+    const text = render({ type: 'root', children: [node] }, slack, markdown, units);
+    if (text.length <= limit) pack(text, '\n\n');
+    else {
+      flush();
+      for (const unit of units.length ? units : [text]) {
+        if (unit.length <= limit) pack(unit, node.type === 'list' ? '\n' : '\n\n');
+        else leaf(unit);
+      }
+      flush();
+    }
+  }
+  flush();
+  return parts;
 }
