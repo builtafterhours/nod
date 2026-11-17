@@ -460,6 +460,17 @@ export function createSlackTransport(
   let streamUnsupported = false;
   let statusUnsupported = false;
   let cardsUnsupported = false;
+  let viewError: string | undefined;
+  let streamError: string | undefined;
+  let statusError: string | undefined;
+  let cardsError: string | undefined;
+  let nativeStopError: string | undefined;
+  const updateRichError = () => {
+    channel.richError =
+      [streamError, statusError, cardsError, nativeStopError, viewError]
+        .filter(Boolean)
+        .join(' ') || undefined;
+  };
   let nextViewAt = 0;
   const nextStreamCall = { start: 0, append: 0, stop: 0 };
   async function pace(kind: keyof typeof nextStreamCall, signal: AbortSignal) {
@@ -826,9 +837,10 @@ export function createSlackTransport(
       )) {
         const code = /^[a-z_]{1,80}$/.test(reason!) ? reason : 'stream_response_warning';
         if (code === 'missing_agent_session_stopped_event_subscription')
-          channel.richError = `Slack native Stop is unavailable: ${code}.`;
+          nativeStopError = `Slack native Stop is unavailable: ${code}.`;
         else throw new MessagingConnectionError(`Slack failed: ${code}.`);
       }
+      updateRichError();
     };
     try {
       for (const [part, text] of parts.entries()) {
@@ -853,11 +865,55 @@ export function createSlackTransport(
               'not_allowed_token_type',
               'channel_type_not_supported',
               'invalid_thread_ts',
+              'access_denied',
+              'accesslimited',
+              'account_inactive',
+              'cannot_provide_both_markdown_text_and_chunks',
+              'cannot_reply_to_message',
+              'channel_not_found',
+              'deprecated_endpoint',
+              'ekm_access_denied',
+              'enterprise_is_restricted',
+              'invalid_arg_name',
+              'invalid_arguments',
+              'invalid_array_arg',
+              'invalid_auth',
+              'invalid_blocks',
+              'invalid_blocks_format',
+              'invalid_charset',
+              'invalid_chunks',
+              'invalid_form_data',
+              'invalid_post_type',
+              'is_archived',
+              'messages_tab_disabled',
+              'method_deprecated',
+              'missing_argument',
+              'missing_post_type',
+              'missing_recipient_team_id',
+              'missing_recipient_user_id',
+              'msg_blocks_too_long',
+              'msg_blocks_too_many',
+              'no_permission',
+              'no_text',
+              'not_authed',
+              'not_in_channel',
+              'restricted_action',
+              'restricted_action_non_threadable_channel',
+              'restricted_action_read_only_channel',
+              'restricted_action_thread_locked',
+              'restricted_action_thread_only_channel',
+              'team_access_not_granted',
+              'team_not_found',
+              'token_expired',
+              'token_revoked',
+              'two_factor_setup_required',
+              'user_not_found',
             ].includes(error.data.error)
           ) {
             streamUnsupported = true;
             await input.stream.record({ part, state: 'uncertain' });
-            channel.richError = `Streaming unavailable. ${failure(error).message}`;
+            streamError = `Streaming unavailable. ${failure(error).message}`;
+            updateRichError();
             return;
           }
           throw error;
@@ -901,6 +957,8 @@ export function createSlackTransport(
         await input.stream.record({ part, state: 'finalized', id: providerId, confirmedChars });
         stoppingStream = false;
       }
+      streamError = undefined;
+      updateRichError();
       return { id: ids[0] ?? '', ids };
     } catch (error) {
       const hold = Date.now() + retryAfter(error);
@@ -916,6 +974,10 @@ export function createSlackTransport(
         await cleanup.chat
           .stopStream({ channel: dm, ts: messageId(openStreamId), session_status: 'active' })
           .catch(() => {});
+      }
+      if (!signal.aborted) {
+        streamError = failure(error).message;
+        updateRichError();
       }
       throw new MessagingDeliveryError(failure(error).message, ids);
     }
@@ -950,16 +1012,17 @@ export function createSlackTransport(
               title: input.title,
               initiator_user_id: parsed.success ? parsed.data.allowedUserId : undefined,
             });
-            if (status.warning === 'missing_agent_session_stopped_event_subscription')
-              channel.richError =
-                'Slack native Stop is unavailable: missing_agent_session_stopped_event_subscription.';
+            nativeStopError =
+              status.warning === 'missing_agent_session_stopped_event_subscription'
+                ? 'Slack native Stop is unavailable: missing_agent_session_stopped_event_subscription.'
+                : undefined;
           } catch (error) {
             if (
               error instanceof WebAPIPlatformError &&
               ['missing_scope', 'feature_disabled'].includes(error.data.error)
             ) {
               statusUnsupported = true;
-              channel.richError = `Native status unavailable. ${failure(error).message}`;
+              statusError = `Native status unavailable. ${failure(error).message}`;
             } else throw failure(error);
           }
         }
@@ -970,7 +1033,11 @@ export function createSlackTransport(
             [key, input.sessionId, input.rootMessageId],
           )
         ).rows[0];
-        if (previous && previous.state !== 'sent') return {};
+        if (previous && previous.state !== 'sent') {
+          viewError = 'Slack controls unavailable: previous control delivery is uncertain.';
+          updateRichError();
+          return {};
+        }
         const text = [
           input.title,
           input.outcome === 'failed'
@@ -1055,13 +1122,15 @@ export function createSlackTransport(
             )
               throw error;
             cardsUnsupported = true;
-            channel.richError = 'Slack task cards unavailable: invalid_blocks.';
+            cardsError = 'Slack task cards unavailable: invalid_blocks.';
             blocks.splice(card, 1);
             return send();
           }
         };
         if (previous?.provider_id) {
           await render();
+          viewError = undefined;
+          updateRichError();
           return { id: previous.provider_id };
         }
         const claim = await pool.query(
@@ -1077,10 +1146,15 @@ export function createSlackTransport(
           "UPDATE channel_slack_views SET state='sent',provider_id=$3 WHERE installation=$1 AND session_id=$2 AND root_id=$4",
           [key, input.sessionId, providerId, input.rootMessageId],
         );
+        viewError = undefined;
+        updateRichError();
         return { id: providerId };
       } catch (error) {
         nextViewAt = Math.max(nextViewAt, Date.now() + retryAfter(error));
-        channel.richError = failure(error).message;
+        if (!lifetime.signal.aborted && !input.signal.aborted) {
+          viewError = failure(error).message;
+          updateRichError();
+        }
         throw failure(error);
       }
     },

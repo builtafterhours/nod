@@ -154,6 +154,8 @@ Long replies are packed into bounded messages by block, table row, or list item.
 
 Rich mode is optional and off by default. It uses [Agent Sessions](https://docs.slack.dev/ai/agent-sessions/) in your verified DM, not a second Nod conversation. Saved tasks keep their own Slack threads. Status reflects working, waiting for you, ready, or closed; closing a stream does not mean a task succeeded.
 
+Main-chat replies follow the current owner message, including work continued from that message. A new main-chat message replaces the previous thread's controls. Old roots cannot select the new work. Results without an exact originating message, such as schedules created within a task, still arrive in your verified DM. They arrive unthreaded and cannot select a task or approve an action, with rich mode on or off.
+
 1. In your Slack app settings, declare the app as an agent with **Agent messaging experience** (`agent_view`). Add `assistant:write` alongside the scopes above. Some AI features require a paid Slack plan; settings alone do not prove availability.
 2. Subscribe to `agent_session_stopped` alongside the three existing bot events. Enable **Interactivity**. Keep Socket Mode enabled; no public request URL or slash commands are needed.
 3. Apply the new permissions in Slack, then select **Channels → Manage Slack → Update connection**. Enter the credentials and select **Rich Slack (requires agent setup)**. For a managed connection, set `SLACK_RICH_ENABLED=true` and apply your configuration.
@@ -194,11 +196,13 @@ settings:
       - agent_session_stopped
 ```
 
-Ordinary replies stream only after Nod has saved and privacy-checked the reply. This is buffered delivery, not live model-token streaming. Long replies roll over at complete Markdown block boundaries; oversized single blocks and cross-message Markdown references use ordinary split messages. A definite unsupported-stream rejection falls back to ordinary delivery. An ambiguous stream failure never resends content: partial text can remain in Slack, while the saved reply remains in Nod. Private steps and approval questions never stream.
+Ordinary replies stream only after Nod has saved and privacy-checked the reply. This is buffered delivery, not live model-token streaming. Long replies roll over at complete Markdown block boundaries; oversized single blocks and cross-message Markdown references use ordinary split messages. A documented rejection that creates no stream falls back to ordinary delivery, with its specific reason in **Manage Slack**. Unknown or ambiguous failures never resend content: partial text can remain in Slack, while the saved reply remains in Nod. Private steps and approval questions never stream.
 
 While a turn is running, its task controls offer **Stop** and **Status**. Each control is bound to that owner, account, thread, session, and exact turn. Old controls cannot stop later work or work in another channel. Native Slack Stop can cancel Nod only when its event names a still-open stream belonging to that exact active turn. Because buffered delivery usually follows model work, native Stop rarely has that binding. Empty or stale stream lists do not cancel Nod; use the current task's **Stop** control instead. Slack may stop rendering a partial stream without cancelling Nod.
 
 Controls expire after 15 minutes and renew while the same work is running. Disconnect invalidates them without cancelling work in other channels. A processing indicator can remain in Slack until Slack's timeout or a verified refresh clears it. Nod doesn't use removed credentials to update it.
+
+If a restart leaves task-thread or control delivery uncertain, Nod does not retry that send. Ordinary replies remain available, but that thread can lack rich controls. Check Slack and use Nod's task controls instead.
 
 Task cards show saved task state alongside the current activity and planned steps. Nod does not mark individual planned steps complete without evidence. Waiting is not success. Media uses Slack-hosted file uploads in the task thread; outgoing audio is a file, not a claimed native recording. A threaded file receipt without a verified parent remains uncertain. Unsupported cards, workspace policies, missing scopes, and client behavior can reduce native affordances; ordinary messages and private Nod controls remain available.
 
