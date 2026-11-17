@@ -1497,17 +1497,20 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             )
               return transport.post(input);
             const context = (
-              await database.query<{ session_id: string; turn_id: string; approval: boolean }>(
-                `SELECT u.session_id,u.id AS turn_id,EXISTS(SELECT 1 FROM approvals a WHERE a.owner_id=m.owner_id AND a.confirmation_message_id=m.id) AS approval
+              await database.query<{
+                session_id: string;
+                thread_id: string;
+                turn_id: string;
+                approval: boolean;
+              }>(
+                `SELECT u.session_id,u.thread_id,u.id AS turn_id,EXISTS(SELECT 1 FROM approvals a WHERE a.owner_id=m.owner_id AND a.confirmation_message_id=m.id) AS approval
              FROM messages m JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id WHERE m.id=$1 AND m.owner_id=$2`,
                 [row.message_id, ownerId],
               )
             ).rows[0];
-            if (context && !context.approval)
+            if (context && !context.approval && context.session_id !== context.thread_id)
               await rich.prepare(context.session_id, context.turn_id);
-            const root = context
-              ? await rich.root(row, context.session_id, context.turn_id)
-              : undefined;
+            const root = context ? await rich.root(row, context.session_id) : undefined;
             const safe = channelText(row.text);
             const stream =
               context &&
