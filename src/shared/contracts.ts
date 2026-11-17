@@ -398,7 +398,7 @@ export interface Preferences {
   proactivePaused: boolean;
   localFilesEnabled: boolean;
 }
-export type ChannelProvider = 'telegram' | 'whatsapp';
+export type ChannelProvider = 'telegram' | 'whatsapp' | 'slack';
 export interface ChannelLinkStatus {
   pairingId?: string;
   state:
@@ -421,7 +421,7 @@ export interface ChannelSetupSummary {
   managed?: boolean;
   accountName?: string;
   accountHandle?: string;
-  mode?: 'polling' | 'webhook' | 'linked';
+  mode?: 'polling' | 'webhook' | 'linked' | 'socket';
   linkMode?: 'bot' | 'self-chat';
   connectionState?: ChannelLinkStatus['state'];
   webhookStatus?: 'registered' | 'manual_setup' | 'registration_pending';

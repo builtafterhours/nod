@@ -117,6 +117,7 @@ export function telegramIdentity(id: string, name?: string, username?: string) {
 
 export function channelLabel(setup: ChannelSetupSummary | undefined, configured: boolean) {
   if (!setup?.enabled) return configured ? 'Configuration present' : 'Not connected';
+  if (setup.provider === 'slack') return 'Only your selected Slack account can message Nod';
   if (setup.mode === 'linked') {
     const states = {
       connecting: 'Connecting to WhatsApp',
@@ -155,6 +156,13 @@ export function channelSetupBody(
   policyConfirmed: boolean,
 ) {
   const webhookUrl = fields.webhookUrl?.trim() || undefined;
+  if (provider === 'slack')
+    return {
+      botToken: fields.botToken?.trim(),
+      appToken: fields.appToken?.trim(),
+      teamId: fields.teamId?.trim(),
+      allowedUserId: fields.allowedUserId?.trim(),
+    };
   if (provider === 'telegram')
     return {
       botToken: fields.botToken?.trim(),

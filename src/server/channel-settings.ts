@@ -18,13 +18,20 @@ import type {
 import type { CredentialKeyStore } from '../ports/key-store.ts';
 import type { ChannelPairingRequest } from '../ports/messaging.ts';
 
-const providerSchema = z.enum(['telegram', 'whatsapp']);
+const providerSchema = z.enum(['telegram', 'whatsapp', 'slack']);
 export type ChannelConnectionObservation = {
   channel: ChannelProvider;
   state: 'disabled' | 'setup_pending' | 'connected' | 'configured_unverified';
 };
 
 function managedConfigurationReady(provider: ChannelProvider, values: Record<string, string>) {
+  if (provider === 'slack')
+    return (
+      /^xoxb-[A-Za-z0-9-]+$/.test(values.SLACK_BOT_TOKEN ?? '') &&
+      /^xapp-[A-Za-z0-9-]+$/.test(values.SLACK_APP_TOKEN ?? '') &&
+      /^T[A-Z0-9]{1,63}$/.test(values.SLACK_TEAM_ID ?? '') &&
+      /^[UW][A-Z0-9]{1,63}$/.test(values.SLACK_ALLOWED_USER_ID ?? '')
+    );
   if (provider === 'telegram')
     return (
       /^\d+:[A-Za-z0-9_-]+$/.test(values.TELEGRAM_BOT_TOKEN ?? '') &&
@@ -81,6 +88,16 @@ export function channelConnectionObservations(
   return [
     { channel: 'telegram', state: telegramState },
     { channel: 'whatsapp', state: whatsappState },
+    ...channels
+      .filter((channel) => channel.provider === 'slack')
+      .map((channel) => ({
+        channel: 'slack' as const,
+        state: !channel.enabled
+          ? ('disabled' as const)
+          : managed.slack && !managedConfigurationReady('slack', managed.slack)
+            ? ('setup_pending' as const)
+            : ('configured_unverified' as const),
+      })),
   ];
 }
 
@@ -90,7 +107,7 @@ const summarySchema = z.object({
   managed: z.boolean().optional(),
   accountName: z.string().max(200).optional(),
   accountHandle: z.string().max(200).optional(),
-  mode: z.enum(['polling', 'webhook', 'linked']).optional(),
+  mode: z.enum(['polling', 'webhook', 'linked', 'socket']).optional(),
   linkMode: z.enum(['bot', 'self-chat']).optional(),
   connectionState: z
     .enum([
@@ -110,7 +127,10 @@ const summarySchema = z.object({
     .string()
     .regex(/^[A-Za-z0-9_]{1,64}$/)
     .optional(),
-  allowedUserId: z.string().regex(telegramUserId).optional(),
+  allowedUserId: z
+    .string()
+    .regex(/^(?:[1-9]\d{0,15}|[UW][A-Z0-9]{1,63})$/)
+    .optional(),
   pairingCandidate: z
     .object({
       id: z.string().regex(telegramUserId),
@@ -138,6 +158,13 @@ const candidateSchema = z.object({
 type TelegramPairingCandidate = z.infer<typeof candidateSchema>;
 const pairingLifetimeMs = 15 * 60 * 1000;
 const fields: Record<ChannelProvider, Set<string>> = {
+  slack: new Set([
+    'SLACK_ENABLED',
+    'SLACK_BOT_TOKEN',
+    'SLACK_APP_TOKEN',
+    'SLACK_TEAM_ID',
+    'SLACK_ALLOWED_USER_ID',
+  ]),
   telegram: new Set([
     'TELEGRAM_ENABLED',
     'TELEGRAM_BOT_TOKEN',
@@ -161,7 +188,7 @@ const fields: Record<ChannelProvider, Set<string>> = {
 };
 export function managedChannelEnvironment(environment: Record<string, string | undefined>) {
   const managed: Partial<Record<ChannelProvider, Record<string, string>>> = {};
-  for (const provider of ['telegram', 'whatsapp'] as const) {
+  for (const provider of ['telegram', 'whatsapp', 'slack'] as const) {
     const values = Object.fromEntries(
       [...fields[provider]]
         .filter((name) => !name.includes('_PAIRING_'))
@@ -174,6 +201,10 @@ export function managedChannelEnvironment(environment: Record<string, string | u
       if (values[name] !== undefined && !['true', 'false'].includes(values[name]))
         throw new Error(`${name} must be true, false or empty.`);
     values[enabled] ??= 'true';
+    if (provider === 'slack') {
+      managed[provider] = values;
+      continue;
+    }
     const mode = `${provider.toUpperCase()}_MODE`;
     values[mode] ??= provider === 'telegram' ? 'polling' : 'cloud';
     if (
@@ -364,6 +395,7 @@ export async function createChannelSettings(
     return key;
   }
   function accountId(provider: ChannelProvider, configured: Record<string, string>) {
+    if (provider === 'slack') return configured.SLACK_TEAM_ID;
     return provider === 'telegram'
       ? configured.TELEGRAM_BOT_TOKEN?.split(':')[0]
       : configured.WHATSAPP_PHONE_NUMBER_ID;
@@ -387,7 +419,7 @@ export async function createChannelSettings(
       observed = options.observed?.();
     } catch {}
     const rows = (await store.read()).filter((row) => !managed[row.provider]);
-    for (const provider of ['telegram', 'whatsapp'] as const) {
+    for (const provider of ['telegram', 'whatsapp', 'slack'] as const) {
       const values = managed[provider];
       if (!values) continue;
       const mode = values[`${provider.toUpperCase()}_MODE`];
@@ -396,10 +428,20 @@ export async function createChannelSettings(
         provider,
         enabled: values[`${provider.toUpperCase()}_ENABLED`] === 'true',
         managed: true,
-        mode: linked ? 'linked' : mode === 'polling' ? 'polling' : 'webhook',
+        mode:
+          provider === 'slack'
+            ? 'socket'
+            : linked
+              ? 'linked'
+              : mode === 'polling'
+                ? 'polling'
+                : 'webhook',
         ...(linked ? { linkMode: mode } : {}),
         ...(provider === 'telegram' && telegramUserId.test(values.TELEGRAM_ALLOWED_USER_ID ?? '')
           ? { allowedUserId: values.TELEGRAM_ALLOWED_USER_ID }
+          : {}),
+        ...(provider === 'slack' && /^[UW][A-Z0-9]{1,63}$/.test(values.SLACK_ALLOWED_USER_ID ?? '')
+          ? { allowedUserId: values.SLACK_ALLOWED_USER_ID }
           : {}),
       });
       rows.push({ provider, enabled: summary.enabled, ciphertext: null, summary });
