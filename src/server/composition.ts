@@ -2972,6 +2972,7 @@ async function initializeApplication(
         keyStore: adapters.keyStore,
         verifier: setup.verifier,
         managed: setup.managed,
+        available: (provider) => channels?.available(provider),
         linkStatus: async () => {
           if (!channels) throw new Error('Messaging is not ready.');
           return channels.pairing();
@@ -2998,13 +2999,16 @@ async function initializeApplication(
               consent.version !== analytics.consent(ownerId).version
             )
               return;
-            const signature = JSON.stringify(states);
+            const observedStates = states.some((state) => state.channel === 'slack')
+              ? states
+              : [...states, { channel: 'slack' as const, state: 'disabled' as const }];
+            const signature = JSON.stringify(observedStates);
             if (
               lastChannelObservation?.consentVersion === consent.version &&
               lastChannelObservation.signature === signature
             )
               return;
-            for (const properties of states)
+            for (const properties of observedStates)
               captureAnalytics(
                 { event: 'channel_connection_observed', properties },
                 { consentRevision: consent.revision },
