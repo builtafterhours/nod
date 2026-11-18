@@ -119,9 +119,9 @@ Every Nod message arrives at the top level of the DM, not as a child in a Slack 
 
 This is the default connection. With **Rich Slack**, ordinary replies and task files use session threads. Approval questions still arrive separately at the top level: answer in that exact question's thread, or react to that exact question. A task thread does not select a child approval question. Partially or uncertainly delivered Slack questions cannot approve an action. An unaddressed DM reply cannot approve one either.
 
-Slack replies use native headings, styled text, numbered and nested lists, quotes, and code where the source can be preserved safely. Tables arrive as stacked labelled rows, including empty fields and extra cells. Long replies continue in ordered parts. A table row too large for one stream uses ordinary split replies instead. Captions use the same rendering; filenames stay literal. Every ordinary part includes its complete plain-text equivalent for notifications and screen readers. A definite first-message formatting rejection can use that plain equivalent instead; an uncertain or partial send is never repeated automatically. A truncation or other response warning does not count as a fully delivered question.
+Slack replies use native headings, styled text, numbered and nested lists, quotes, and code where the source can be kept exactly. Tables arrive as stacked labelled rows that keep their column labels, including empty fields and extra cells. Long replies continue in ordered parts, split by block, table row or list item; ordered lists keep their numbering, and oversized blocks split without breaking code, links or escaped characters (a link too long for one part becomes plain text). A table row too large for one stream uses ordinary split replies instead. Captions use the same rendering; filenames stay literal. Every part includes a complete plain-text version for notifications and screen readers. A definite first-message formatting rejection can use that plain version instead. An uncertain or partial send is never repeated automatically, and a truncated or warned reply doesn't count as a fully delivered question.
 
-Some messages deliberately show their original Markdown instead. Any ampersand, backslash, less-than sign, percent sign, carriage return, tab, or byte-order mark selects literal text for the whole message, even in innocent prose or code. References, images, automatic links, unsupported syntax, and source-position or size limits can do the same. These messages do not stream. Encoded text stays encoded as written, without reconstructing a destination. This formatting safeguard does not fix the existing server filter's handling of encoded private links. Text with NUL or invalid Unicode is refused before sending, not silently replaced.
+Some messages show their original Markdown instead, when Slack formatting can't keep them exactly: for example text with an ampersand, backslash, less-than sign, percent sign, tab or carriage return, references, images, automatic links, or very large messages. These messages don't stream. Text with NUL or invalid Unicode is refused before sending.
 
 Use these as ordinary DM text, not workspace slash commands:
 
@@ -138,19 +138,15 @@ Slack's own slash commands can have workspace-wide effects. Nod neither register
 
 Slack supports text, links, images, documents, video, and audio files, including audio clips. Captions stay with attachments. Incoming audio uses Nod's normal voice settings; outgoing audio arrives as a file, not a native Slack recording. Files are limited to 20 MB each in both directions, with the shared ten-file and 50 MB intake caps. Remote files outside Slack's private file service are not downloaded. If a file cannot be sent, open Nod to get it.
 
-Slack has no generic bot typing indicator. Queued messages get Nod's eyes reaction until they are read. Useful progress and results arrive as ordinary messages. Standard reactions supported by Nod's channel emoji library work in both directions; custom workspace emoji and unsupported emoji are ignored. Sign-in, payments, and browser handoffs still finish privately in Nod.
+Slack has no bot typing indicator. Queued messages get Nod's eyes reaction until they are read, and progress and results arrive as ordinary messages. For native agent status, turn on [Rich Slack](#rich-slack). Standard reactions supported by Nod's channel emoji library work in both directions; custom workspace emoji and unsupported emoji are ignored. Sign-in, payments, and browser handoffs still finish privately in Nod.
 
-Slack does offer native agent progress. Enable the optional setup below to use it; absence of a generic typing method does not mean native agent status is unavailable.
-
-Slack lets you leave several reactions on one message. Nod tracks only your latest supported reaction; removing it clears Nod's reaction state, even if another remains visible. Removal never reverses an action.
-
-With rich mode, Nod tracks supported reactions separately. Removing one shows your most recently added remaining reaction. This display change never approves or repeats an action. Custom emoji have no inferred meaning. Reactions missed during an outage are not reconstructed from history.
+Slack lets you leave several reactions on one message. Nod tracks only your latest supported reaction; removing it clears Nod's reaction state, even if another remains visible. With rich mode, removing one shows your most recently added remaining reaction instead. Removing a reaction never approves, repeats or reverses an action. Custom emoji have no inferred meaning, and reactions missed during an outage are not reconstructed from history.
 
 If Slack supplies incomplete file metadata, Nod reports an attachment failure instead of silently ignoring your message. Resend the text without the file to continue. Media preparation finishes before Nod acknowledges intake, so Slack can redeliver slow uploads. Saved messages are deduplicated.
 
 After a connection interruption, Nod keeps trying while Slack is configured, with failure waits increasing from two to 30 seconds. Slack's retry-after delay can extend a wait to five minutes. Connection recovery runs in the background without holding up other channels. An explicit authentication, identity, or configuration failure stops recovery until you select **Manage Slack → Reconnect**. Slack can replay recent events; Nod deduplicates saved messages and fences reaction replays. Nod does not fetch old DM history after a restart. If no reply arrives, send a new message. A message or file whose delivery is uncertain is never automatically sent again. Check Slack before asking for another attempt.
 
-Long replies are packed into bounded messages by block, table row, or list item. Table rows retain their original column labels, and ordered lists keep their numbering. Oversized blocks split without breaking code fences, links, or escaped characters; a link too long for one part becomes plain text. A missing file message receipt leaves delivery uncertain. Nod keeps confirmed text and file targets and continues the remaining attachments without uploading any file twice.
+A missing file message receipt leaves delivery uncertain. Nod keeps confirmed text and file targets and continues the remaining attachments without uploading any file twice.
 
 ### Rich Slack
 
@@ -216,8 +212,8 @@ While the current task is running, an optional **Reported starts** strip shows o
 
 Media uses Slack-hosted file uploads in the task thread; outgoing audio is a file, not a claimed native recording. A threaded file receipt without a verified parent remains uncertain. Unsupported cards, workspace policies, missing scopes, and client behavior can reduce native affordances; ordinary messages and private Nod controls remain available.
 
-:::caution[Slack acceptance]
-This channel has not yet been accepted against an owner-authorized Slack test workspace. Native formatting, nested-entity display, no-ping and automatic-link behavior, notifications and accessibility still need desktop and mobile checks, alongside workspace policy, mobile audio, file receipts, and reconnect behavior. Local rendering checks are not native Slack acceptance.
+:::caution
+Slack support is new and hasn't been tested in every Slack client yet. Formatting, notifications, files, audio and reconnects can differ between Slack desktop and mobile.
 :::
 
 <details>
