@@ -151,7 +151,12 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
     const parts = literal(source);
     return { units: [], parts, plain: parts };
   };
-  if (!source || metadata || source.length > 100_000 || /[\r\uFEFF]|<[!@#]/u.test(source))
+  if (
+    !source ||
+    metadata ||
+    source.length > 100_000 ||
+    /[\r\uFEFF]|<[!@#]|&(?:lt|gt|#0*6[02]|#x0*3[ce]);?/iu.test(source)
+  )
     return fallback();
   try {
     const root = parseMarkdown(source);
@@ -217,17 +222,21 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
         ];
       return children(node).flatMap((n) => inline(n, style));
     };
-    const leaf = (node: Node, style: Style = {}): Span[] => {
+    const leaf = (node: Node, style: Style = {}, quoted = false): Span[] => {
       if (exact(node, source)) return inline(node, style);
       const parts = children(node);
+      if (!parts.length) return [];
       const positioned = parts.every(
         (child) =>
           Number.isInteger(child.position?.start.offset) &&
           Number.isInteger(child.position?.end.offset),
       );
-      const from = positioned && parts.length ? start(parts[0]) : start(node);
-      const to = positioned && parts.length ? end(parts[parts.length - 1]) : end(node);
-      return [{ text: source.slice(from, to), style, from, end: to, raw: true }];
+      if (!positioned && node.type !== 'paragraph') throw new Error('native_shape');
+      const from = positioned ? start(parts[0]) : start(node);
+      const to = positioned ? end(parts[parts.length - 1]) : end(node);
+      const text = source.slice(from, to);
+      if (quoted && text.includes('\n')) throw new Error('native_shape');
+      return [{ text, style, from, end: to, raw: true }];
     };
     const emit = (
       spans: Span[],
@@ -384,7 +393,12 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
       } else if (node.type === 'blockquote') {
         if (node.children.length !== 1 || node.children[0].type !== 'paragraph')
           throw new Error('native_shape');
-        emit(leaf(node.children[0]), { type: 'quote' }, end(node), units.length ? separator : '');
+        emit(
+          leaf(node.children[0], {}, true),
+          { type: 'quote' },
+          end(node),
+          units.length ? separator : '',
+        );
       } else if (node.type === 'list') {
         if (indent > 8) throw new Error('native_indent');
         if (
