@@ -292,6 +292,19 @@ export interface TaskWait {
   who: string;
   via: string;
 }
+export type TaskPlan = {
+  ownerId: string;
+  taskId: string;
+  sessionId: string;
+  planRevision: number;
+  progressRevision: number;
+} & (
+  | { kind: 'legacy'; state: 'unknown' }
+  | {
+      kind: 'structured';
+      steps: Array<{ id: string; title: string; state: 'pending' | 'started' }>;
+    }
+);
 export interface Task {
   id: string;
   title: string;
@@ -312,6 +325,7 @@ export interface Task {
   stepIndex?: number;
   revision?: number;
   appliedRevision?: number;
+  plan?: TaskPlan;
   model?: ModelSelection | null;
   work?: WorkKind;
   scheduleModel?: ModelSelection;
