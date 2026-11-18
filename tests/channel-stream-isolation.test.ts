@@ -118,6 +118,7 @@ test(
         { channel: 'telegram:account_one:sender_one', source: 'user', marker: 'telegram-one' },
         { channel: 'telegram:account_two:sender_two', source: 'user', marker: 'telegram-two' },
         { channel: 'whatsapp:account_one:sender_one', source: 'user', marker: 'whatsapp-one' },
+        { channel: 'slack:account_one:sender_one', source: 'user', marker: 'slack-one' },
         { channel: 'web', source: 'schedule', marker: 'web-reminder' },
         { channel: 'web', source: 'event', marker: 'web-event' },
         { channel: 'web', source: 'user', marker: 'web-reply' },
@@ -166,6 +167,18 @@ test(
       }
       await waitFor(() =>
         wire.some((event) => event.streamId === 'stream-web-reply' && event.done),
+      );
+      assert.deepEqual(
+        [...new Set(wire.filter((event) => event.type === 'delta').map((event) => event.streamId))],
+        ['stream-web-reply'],
+      );
+      assert.deepEqual(
+        (
+          await db.pool.query(
+            "SELECT text FROM messages WHERE role='assistant' ORDER BY created_at,id",
+          )
+        ).rows.map((row) => row.text),
+        modes.map((mode) => mode.marker),
       );
     } finally {
       controller.abort();

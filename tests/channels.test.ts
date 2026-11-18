@@ -15,7 +15,11 @@ import { createCommunication } from '../src/server/communication.ts';
 import { createVault } from '../src/server/vault.ts';
 import { locksTable } from '../src/server/locks.ts';
 import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
-import { MessagingAttachmentError, type MessagingTransport } from '../src/ports/messaging.ts';
+import {
+  MessagingAttachmentError,
+  type MessagingControl,
+  type MessagingTransport,
+} from '../src/ports/messaging.ts';
 import { telegramAttachments, telegramMessage } from '../src/providers/chat-sdk/telegram.ts';
 import {
   createWhatsAppLinkedTransport,
@@ -1326,6 +1330,78 @@ test(
     }
   },
 );
+
+test('combined channels keep Slack controls, conversations and posts apart from Telegram and WhatsApp', async () => {
+  const seen: string[] = [];
+  const accepted: string[] = [];
+  const emitters = new Map<string, (input: MessagingControl) => Promise<void>>();
+  const fake = (id: string, pairing = false): MessagingTransport => ({
+    channels: [
+      { id, status: 'configured', missing: [], accountId: `${id}-account`, allowedSenderIds: [] },
+    ],
+    poll: async () => {},
+    receive: async () => ({ status: 200, body: {} }),
+    post: async () => {
+      seen.push(`${id}:post`);
+      return { id: `${id}-message` };
+    },
+    controls: (accept) => {
+      emitters.set(id, accept);
+      return () => emitters.delete(id);
+    },
+    conversation: async () => {
+      seen.push(`${id}:conversation`);
+      return { id: `${id}-root` };
+    },
+    ...(pairing
+      ? { pairing: async () => ({ id: 'pairing', qr: 'synthetic', expiresAt: '' }) as never }
+      : {}),
+    close: async () => {},
+  });
+  const control = (channelId: string): MessagingControl => ({
+    channelId,
+    accountId: 'TFIXTURE',
+    senderId: 'UOWNER',
+    threadId: 'DOWNER',
+    eventId: `${channelId}-event`,
+    rootMessageId: 'DOWNER:1700000000.000001',
+    action: 'stop',
+  });
+  const combined = combineMessagingTransports(fake('telegram'), fake('slack'));
+  assert.equal(combined.pairing, undefined);
+  assert.equal(
+    typeof combineMessagingTransports(fake('whatsapp', true), fake('slack')).pairing,
+    'function',
+  );
+  const release = combined.controls!(async (input) => {
+    accepted.push(`${input.channelId}:${input.eventId}`);
+  });
+  await emitters.get('telegram')!(control('slack'));
+  await emitters.get('slack')!(control('telegram'));
+  await emitters.get('slack')!(control('slack'));
+  assert.deepEqual(accepted, ['slack:slack-event']);
+  const conversation = {
+    ownerId: 'local-development',
+    accountId: 'TFIXTURE',
+    threadId: 'DOWNER',
+    sessionId: randomUUID(),
+    turnId: randomUUID(),
+    rootMessageId: 'DOWNER:1700000000.000001',
+    status: 'processing',
+    title: 'Synthetic task',
+    text: '',
+    signal: new AbortController().signal,
+  } as const;
+  assert.deepEqual(await combined.conversation!({ ...conversation, channelId: 'whatsapp' }), {});
+  assert.deepEqual(await combined.conversation!({ ...conversation, channelId: 'slack' }), {
+    id: 'slack-root',
+  });
+  await combined.post({ channelId: 'telegram', accountId: 'a', threadId: 'b', text: 'Synthetic' });
+  await combined.post({ channelId: 'slack', accountId: 'a', threadId: 'b', text: 'Synthetic' });
+  assert.deepEqual(seen, ['slack:conversation', 'telegram:post', 'slack:post']);
+  release();
+  assert.equal(emitters.size, 0);
+});
 
 test('Telegram media keeps native replies and checks the sender before any download', async () => {
   const bytes = Buffer.from('synthetic image bytes');

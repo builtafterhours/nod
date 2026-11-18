@@ -71,6 +71,7 @@ import type { UsageTelemetry } from '../ports/provider-usage.ts';
 import { agentModels, defaultEffort, defaultModel } from '../shared/model-defaults.ts';
 import { createChatSdkTransport } from '../providers/chat-sdk/index.ts';
 import { createWhatsAppLinkedTransport } from '../providers/chat-sdk/whatsapp.ts';
+import { createSlackTransport } from '../providers/chat-sdk/slack.ts';
 import { combineMessagingTransports } from '../providers/chat-sdk/combined.ts';
 import { createChatSdkSetupVerifier } from '../providers/chat-sdk/settings.ts';
 import { createContainerBrowserComputer } from '../providers/container-browser/index.ts';
@@ -155,7 +156,7 @@ import { connectedGmail } from '../shared/onboarding.ts';
 import { createPostgresObjectStore } from './object-storage.ts';
 import { loadPrivacyNoticeFile, registerPrivacyNotice } from './privacy.ts';
 import { createDocumentation } from './documentation.ts';
-import { initializeDatabase, pool } from './db.ts';
+import { cancellationTransaction, initializeDatabase, pool } from './db.ts';
 import { events, refresh } from './events.ts';
 import { createIntegrations } from './integrations.ts';
 import { gmailDraftTarget, gmailMessageTarget } from './action-presentation.ts';
@@ -637,9 +638,13 @@ export function createDefaultAdapters(
           (mode !== 'bot' && mode !== 'self-chat') ||
           (mode === 'bot' && !/^\d{7,15}$/.test(configured.WHATSAPP_ALLOWED_NUMBER ?? ''))
         )
-          return createChatSdkTransport(pool, configured);
+          return combineMessagingTransports(
+            createChatSdkTransport(pool, configured),
+            createSlackTransport(pool, configured),
+          );
         return combineMessagingTransports(
           createChatSdkTransport(pool, { ...configured, WHATSAPP_ENABLED: 'false' }),
+          createSlackTransport(pool, configured),
           createWhatsAppLinkedTransport({
             mode,
             allowedNumber: configured.WHATSAPP_ALLOWED_NUMBER,
@@ -2065,7 +2070,9 @@ async function initializeApplication(
         event: 'owner_message_accepted',
         properties: {
           channel:
-            source === 'web' || source === 'telegram' || source === 'whatsapp' ? source : 'other',
+            source === 'web' || source === 'telegram' || source === 'whatsapp' || source === 'slack'
+              ? source
+              : 'other',
         },
       });
     };
@@ -2897,6 +2904,7 @@ async function initializeApplication(
         keyStore: adapters.keyStore,
         verifier: setup.verifier,
         managed: setup.managed,
+        available: (provider) => channels?.available(provider),
         linkStatus: async () => {
           if (!channels) throw new Error('Messaging is not ready.');
           return channels.pairing();
@@ -2923,13 +2931,16 @@ async function initializeApplication(
               consent.version !== analytics.consent(ownerId).version
             )
               return;
-            const signature = JSON.stringify(states);
+            const observedStates = states.some((state) => state.channel === 'slack')
+              ? states
+              : [...states, { channel: 'slack' as const, state: 'disabled' as const }];
+            const signature = JSON.stringify(observedStates);
             if (
               lastChannelObservation?.consentVersion === consent.version &&
               lastChannelObservation.signature === signature
             )
               return;
-            for (const properties of states)
+            for (const properties of observedStates)
               captureAnalytics(
                 { event: 'channel_connection_observed', properties },
                 { consentRevision: consent.revision },
@@ -2944,6 +2955,8 @@ async function initializeApplication(
       ? setup.create(await channelSettings!.environment())
       : adapters.messaging!;
     channels = await createChannels(pool, {
+      control: tasks.channelControl,
+      cancel: (work) => cancellationTransaction(work, pool),
       admission,
       ownerId,
       present: communication.present,
@@ -2958,7 +2971,7 @@ async function initializeApplication(
       classifyRetiredReply: (reply, expired) =>
         ledger.forOwner(() => trust.classifyRetiredReply(reply, expired)),
       acceptVerification: (text, input) => chatVerification.accept(text, input),
-      reacted: (messageId, reaction) => reactToMessage(messageId, reaction),
+      reacted: (messageId, reaction, wake) => reactToMessage(messageId, reaction, wake),
       activeThread: (client) => lockThread(client),
       activity: activity.read,
       taskCommand: tasks.chatCommand,
@@ -3027,6 +3040,7 @@ async function initializeApplication(
         attachments,
         onInserted,
         stopSignal,
+        replyContext,
       ) =>
         (
           await userMessages.submit(text, attachments, {
@@ -3038,6 +3052,7 @@ async function initializeApplication(
             answer,
             onInserted,
             stopSignal,
+            replyContext,
           })
         ).turnId,
       stopSignal,

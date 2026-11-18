@@ -1608,3 +1608,484 @@ test(
     }
   },
 );
+
+test(
+  'Slack records Stop controls before acknowledging them and refuses replayed, stale, foreign and other-turn controls',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 60_000 },
+  async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 55_000,
+      env: { ...serviceEnvironment(), TEST_DATABASE_URL: process.env.TEST_DATABASE_URL },
+      input: String.raw`
+        import assert from 'node:assert/strict';
+        import { randomUUID } from 'node:crypto';
+        import { mkdtemp, rm } from 'node:fs/promises';
+        import { tmpdir } from 'node:os';
+        import { join } from 'node:path';
+        import { setTimeout as delay } from 'node:timers/promises';
+        import pg from 'pg';
+        import { SocketModeClient } from '@slack/socket-mode';
+        const repo = process.cwd();
+        const suffix = randomUUID().replaceAll('-', '').slice(0, 16);
+        const schema = 'test_slack_controls_' + suffix;
+        const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+        await admin.query('CREATE SCHEMA ' + schema);
+        const url = new URL(process.env.TEST_DATABASE_URL);
+        url.searchParams.set('options', '-c search_path=' + schema);
+        process.env.DATABASE_URL = url.href;
+        process.env.PGBOSS_SCHEMA = schema + '_boss';
+        const data = await mkdtemp(join(tmpdir(), 'nod-slack-controls-'));
+        process.env.NOD_DATA_ROOT = data;
+        let socket;
+        SocketModeClient.prototype.start = async function () {
+          socket = this;
+          this.emit('connected');
+          return { ok: true };
+        };
+        let sequence = 0;
+        const ts = () => '1700000000.' + String(++sequence).padStart(6, '0');
+        const identity = {
+          'auth.test': { team_id: 'TFIXTURE', bot_id: 'BFIXTURE', user_id: 'UBOT' },
+          'bots.info': { bot: { app_id: 'AFIXTURE' } },
+          'users.info': { user: { id: 'UOWNER', team_id: 'TFIXTURE' } },
+          'conversations.open': { channel: { id: 'DOWNER' } },
+          'conversations.info': { channel: { is_im: true, user: 'UOWNER' } },
+        };
+        globalThis.fetch = async (input, init) => {
+          const address = new URL(String(input));
+          assert.equal(address.origin, 'https://slack.com');
+          const method = address.pathname.split('/').at(-1);
+          if (method in identity) return Response.json({ ok: true, ...identity[method] });
+          assert.ok(['agents.sessions.setStatus', 'chat.postMessage', 'chat.update'].includes(method), method);
+          const body = Object.fromEntries(new URLSearchParams(String(init?.body ?? '')));
+          return Response.json({ ok: true, ts: body.ts ?? ts() });
+        };
+        const db = await import(repo + '/src/server/db.ts');
+        const thread = await import(repo + '/src/server/thread.ts');
+        const { createTasks } = await import(repo + '/src/server/tasks.ts');
+        const { ownerId } = await import(repo + '/src/server/config.ts');
+        const { nodTools } = await import(repo + '/src/runtime/tools.ts');
+        const { createChannelRich } = await import(repo + '/src/server/channel-rich.ts');
+        const { createSlackTransport } = await import(repo + '/src/providers/chat-sdk/slack.ts');
+        const q = (sql, values) => db.pool.query(sql, values);
+        const until = async (check, label) => {
+          for (let attempt = 0; attempt < 500; attempt++) {
+            if (await check()) return;
+            await delay(10);
+          }
+          assert.fail(label);
+        };
+        let rich, transport, releaseThread, controlCalls = 0;
+        try {
+          await db.initializeDatabase();
+          const tasks = createTasks({ pool: db.pool, ownerId, clearBrowser: async () => {} });
+          await tasks.initialize();
+          await q('CREATE TABLE IF NOT EXISTS schedules(id uuid,owner_id text,model jsonb)');
+          await q('CREATE TABLE IF NOT EXISTS channel_inbox(source_id text PRIMARY KEY,owner_id text,provider text,account_id text,sender_id text,thread_id text,channel text,state text,turn_id uuid,message_id uuid,received_at timestamptz DEFAULT now())');
+          await thread.initializeThreads();
+          const threadId = (await thread.activeThread()).id;
+          transport = createSlackTransport(db.pool, {
+            SLACK_ENABLED: 'true',
+            SLACK_RICH_ENABLED: 'true',
+            SLACK_BOT_TOKEN: 'xoxb-fixture-never-live',
+            SLACK_APP_TOKEN: 'xapp-fixture-never-live',
+            SLACK_TEAM_ID: 'TFIXTURE',
+            SLACK_ALLOWED_USER_ID: 'UOWNER',
+          });
+          await transport.poll(async () => {});
+          await until(() => transport.channels[0].available, 'Slack did not connect.');
+          rich = await createChannelRich(db.pool, {
+            ownerId,
+            transport: () => transport,
+            permitted: (row) => row.account_id === 'TFIXTURE' && row.sender_id === 'UOWNER',
+            safe: (text) => ({ text, secureAction: false, artifact: false }),
+            lock: thread.lockThread,
+            cancel: (work) => db.cancellationTransaction(work, db.pool),
+            control: async (client, target) => {
+              controlCalls++;
+              return tasks.channelControl(client, target);
+            },
+          });
+          const status = async (turn) => (await q('SELECT status FROM turns WHERE id=$1', [turn])).rows[0].status;
+          const root = async (session) => (await q('SELECT * FROM channel_roots WHERE session_id=$1', [session])).rows[0];
+          const intent = async (event) => (await q('SELECT state,outcome FROM channel_control_intents WHERE event_id=$1', [event])).rows[0];
+          const intents = async () => (await q('SELECT count(*)::int AS n FROM channel_control_intents')).rows[0].n;
+          const settled = (event) => until(async () => ['applied', 'refused', 'expired'].includes((await intent(event))?.state), 'Control ' + event + ' did not settle.');
+          const createTask = async (title) => {
+            const turnId = randomUUID();
+            const messageId = randomUUID();
+            const source = 'channel:slack:TFIXTURE:DOWNER:' + ts();
+            await q("INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,started_at,message_id,channel,channel_source_id) VALUES($1,$2,$3,$3,'user','Synthetic work','running',now(),$4,'slack:fixture',$5)", [turnId, ownerId, threadId, messageId, source]);
+            await q("INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'user','Synthetic owner instruction')", [messageId, ownerId, threadId, turnId]);
+            await q("INSERT INTO channel_inbox(source_id,owner_id,provider,account_id,sender_id,thread_id,channel,state,turn_id,message_id) VALUES($1,$2,'slack','TFIXTURE','UOWNER','DOWNER','slack:fixture','submitted',$3,$4)", [source, ownerId, turnId, messageId]);
+            const tool = nodTools({
+              context: { background: false, signal: new AbortController().signal, task: (input) => tasks.execute({ turnId, threadId }, input, messageId) },
+              execution: { browserId: 'fixture' },
+              computer: {},
+            }).find((candidate) => candidate.name === 'task');
+            const task = await tool.execute({ action: 'start', title, message: 'Synthetic start', now: 'Working', doneWhen: 'Inspectable result' });
+            const child = (await q('SELECT id FROM turns WHERE task_id=$1 AND session_id=$1', [task.id])).rows[0].id;
+            await q("UPDATE turns SET status='running',started_at=now() WHERE id=$1", [child]);
+            await q("UPDATE turns SET status='succeeded',finished_at=now() WHERE id=$1", [turnId]);
+            await tasks.inherit({ turnId: child, threadId });
+            await rich.prepare(task.id, child);
+            return { session: task.id, turn: child, row: await root(task.id) };
+          };
+          const emit = (type, body) => {
+            let acked = false;
+            socket.emit('slack_event', { type, body, ack: async () => { acked = true; } });
+            return () => acked;
+          };
+          const press = (row, change = {}) => {
+            const action = change.action ?? 'nod_stop';
+            const actionTs = change.actionTs ?? ts();
+            const nonce = change.nonce ?? (action === 'nod_stop' ? row.nonce : row.status_nonce);
+            const messageTs = (change.messageId ?? row.control_message_id).split(':')[1];
+            const acked = emit('interactive', {
+              type: 'block_actions', api_app_id: 'AFIXTURE', team: { id: 'TFIXTURE' }, user: { id: 'UOWNER' },
+              container: { type: 'message', channel_id: 'DOWNER', message_ts: messageTs },
+              actions: [{ action_id: action, value: nonce, action_ts: actionTs }],
+              ...change.body,
+            });
+            return { acked, event: 'DOWNER:' + messageTs + ':' + actionTs + ':' + action + ':' + nonce };
+          };
+          const holdThread = async () => {
+            const holder = new pg.Pool({ connectionString: url.href, max: 1 });
+            const client = await holder.connect();
+            await client.query('INSERT INTO nod_locks(key) VALUES($1) ON CONFLICT DO NOTHING', ['thread:' + ownerId]);
+            await client.query('BEGIN');
+            await client.query('SELECT 1 FROM nod_locks WHERE key=$1 FOR UPDATE', ['thread:' + ownerId]);
+            releaseThread = async () => {
+              releaseThread = undefined;
+              await client.query('ROLLBACK');
+              client.release();
+              await holder.end();
+            };
+            return releaseThread;
+          };
+
+          const held = await createTask('Synthetic held task');
+          const release = await holdThread();
+          const stop = press(held.row);
+          const started = performance.now();
+          await until(stop.acked, 'Stop was not acknowledged while the thread was busy.');
+          assert.ok(performance.now() - started < 1000);
+          assert.deepEqual(await intent(stop.event), { state: 'pending', outcome: null });
+          assert.equal((await q('SELECT count(*)::int AS n FROM channel_controls')).rows[0].n, 0);
+          assert.equal(await status(held.turn), 'running');
+          const replay = press(held.row, { actionTs: stop.event.split(':')[2] });
+          await until(replay.acked, 'A repeated Stop was not acknowledged.');
+          await release();
+          await settled(stop.event);
+          assert.deepEqual(await intent(stop.event), { state: 'applied', outcome: 'stop' });
+          assert.equal(await status(held.turn), 'cancelled');
+          const again = press(held.row, { actionTs: stop.event.split(':')[2] });
+          await until(again.acked, 'A replayed Stop was not acknowledged.');
+          await delay(200);
+          assert.equal(await intents(), 1);
+          assert.equal(controlCalls, 1);
+
+          const current = await createTask('Synthetic current task');
+          const other = await createTask('Synthetic other task');
+          const others = [];
+          for (const channel of ['telegram:fixture', 'whatsapp:fixture', 'web']) {
+            const id = randomUUID();
+            await q("INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,channel,status,started_at) VALUES($1,$2,$3,$1,'user','Synthetic other channel',$4,'running',now())", [id, ownerId, threadId, channel]);
+            others.push(id);
+          }
+          const running = async () => {
+            for (const turn of [current.turn, other.turn, ...others]) assert.equal(await status(turn), 'running');
+          };
+          for (const [change, outcome] of [
+            [{ nonce: randomUUID() }, 'stale_nonce'],
+            [{ nonce: current.row.status_nonce }, 'stale_nonce'],
+            [{ messageId: other.row.control_message_id }, 'stale_nonce'],
+          ]) {
+            const refused = press(current.row, change);
+            await settled(refused.event);
+            assert.deepEqual(await intent(refused.event), { state: 'refused', outcome });
+            await running();
+          }
+          const native = emit('events_api', {
+            team_id: 'TFIXTURE', api_app_id: 'AFIXTURE', event_id: 'EvUnknownStream',
+            event: { type: 'agent_session_stopped', user: 'UOWNER', channel: 'DOWNER', thread_ts: current.row.root_id.split(':')[1], streaming_message_ts: [ts()], event_ts: ts() },
+          });
+          await settled('EvUnknownStream');
+          assert.ok(native());
+          assert.deepEqual(await intent('EvUnknownStream'), { state: 'refused', outcome: 'stream' });
+          const before = await intents();
+          for (const body of [
+            { user: { id: 'UFOREIGN' } },
+            { team: { id: 'TFOREIGN' } },
+            { api_app_id: 'AFOREIGN' },
+            { container: { type: 'message', channel_id: 'CPUBLIC', message_ts: current.row.control_message_id.split(':')[1] } },
+          ]) {
+            const dropped = press(current.row, { body });
+            await until(dropped.acked, 'A foreign control was not acknowledged.');
+          }
+          await delay(200);
+          assert.equal(await intents(), before);
+          await running();
+          assert.equal(controlCalls, 1);
+          const fresh = press(current.row);
+          await settled(fresh.event);
+          assert.deepEqual(await intent(fresh.event), { state: 'applied', outcome: 'stop' });
+          assert.equal(await status(current.turn), 'cancelled');
+          for (const turn of [other.turn, ...others]) assert.equal(await status(turn), 'running');
+        } finally {
+          await releaseThread?.().catch(() => {});
+          await rich?.close();
+          await transport?.close();
+          await thread.stopThreadWorkers().catch(() => {});
+          await db.pool.end();
+          await admin.query('DROP SCHEMA IF EXISTS ' + schema + '_boss CASCADE');
+          await admin.query('DROP SCHEMA IF EXISTS ' + schema + ' CASCADE');
+          await admin.end();
+          await rm(data, { recursive: true, force: true });
+        }
+      `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  },
+);
+
+test(
+  'Slack answers and approvals bind only to the exact fully delivered message of the same owner conversation',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 60_000 },
+  async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 55_000,
+      env: { ...serviceEnvironment(), TEST_DATABASE_URL: process.env.TEST_DATABASE_URL },
+      input: String.raw`
+        import assert from 'node:assert/strict';
+        import { randomUUID } from 'node:crypto';
+        import { mkdtemp, rm } from 'node:fs/promises';
+        import { tmpdir } from 'node:os';
+        import { join } from 'node:path';
+        import { setTimeout as delay } from 'node:timers/promises';
+        import pg from 'pg';
+        const repo = process.cwd();
+        const suffix = randomUUID().replaceAll('-', '').slice(0, 16);
+        const schema = 'test_slack_answers_' + suffix;
+        const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+        await admin.query('CREATE SCHEMA ' + schema);
+        const url = new URL(process.env.TEST_DATABASE_URL);
+        url.searchParams.set('options', '-c search_path=' + schema);
+        process.env.DATABASE_URL = url.href;
+        process.env.PGBOSS_SCHEMA = schema + '_boss';
+        const data = await mkdtemp(join(tmpdir(), 'nod-slack-answers-'));
+        process.env.NOD_DATA_ROOT = data;
+        globalThis.fetch = async () => assert.fail('No network is permitted.');
+        const db = await import(repo + '/src/server/db.ts');
+        const thread = await import(repo + '/src/server/thread.ts');
+        const { ownerId } = await import(repo + '/src/server/config.ts');
+        const { createChannels } = await import(repo + '/src/server/channels.ts');
+        const { createTasks } = await import(repo + '/src/server/tasks.ts');
+        const { createApprovals } = await import(repo + '/src/server/approvals.ts');
+        const { createTrust } = await import(repo + '/src/server/trust.ts');
+        const q = (sql, values) => db.pool.query(sql, values);
+        let service;
+        let sequence = 0;
+        let answerCalls = 0;
+        const posts = [];
+        const queue = [];
+        const trustInputs = [];
+        const ts = (prefix) => 'DOWNER:' + prefix + '.' + String(++sequence).padStart(6, '0');
+        const config = { id: 'slack', rich: true, installationId: 'fixture-installation', available: true, status: 'configured', missing: [], supportsAttachments: true, accountId: 'TFIXTURE', allowedSenderIds: ['UOWNER'] };
+        const transport = {
+          channels: [config],
+          controls: () => () => {},
+          async poll(accept) {
+            for (const message of queue.splice(0)) await accept(message);
+          },
+          async conversation(input) {
+            return input.current && !(await input.current()) ? {} : { id: ts('1700000003') };
+          },
+          async post(input) {
+            const id = ts('1700000004');
+            posts.push({ ...input, id });
+            if (input.stream)
+              for (const state of ['starting', 'dispatching', 'open', 'finalizing', 'finalized'])
+                await input.stream.record({ part: 0, state, ...(['open', 'finalized'].includes(state) ? { id, confirmedChars: input.text.length } : {}) });
+            return { id };
+          },
+          async close() {},
+        };
+        try {
+          await db.initializeDatabase();
+          await thread.initializeThreads();
+          const tasks = createTasks({ pool: db.pool, ownerId });
+          await tasks.initialize();
+          await q('CREATE TABLE IF NOT EXISTS schedules(id uuid,owner_id text)');
+          const { id: threadId } = await thread.activeThread();
+          const approvals = await createApprovals(async () => assert.fail('No action runs.'), undefined, async () => {
+            answerCalls++;
+            return true;
+          });
+          const users = thread.createUserMessageService({ confirmAction: approvals.chat, taskReply: tasks.resolveReply });
+          const trust = createTrust({ pool: db.pool, ownerId, review: async (_instructions, input) => {
+            trustInputs.push(input);
+            return { run: false };
+          } });
+          service = await createChannels(db.pool, {
+            ownerId,
+            transport,
+            activeThread: thread.lockThread,
+            control: tasks.channelControl,
+            cancel: (work) => db.cancellationTransaction(work, db.pool),
+            present: async (_thread, input) => input.text || 'Synthetic private step',
+            intervalMs: 60000,
+            subscribe: () => () => {},
+            resolveAttachments: async () => [],
+            submit: async (text, sourceId, client, channel, clientMessageId, answer, replyToMessageId, attachments, onInserted, stopSignal, replyContext) =>
+              (await users.submit(text, attachments, { sourceId, channel, client, clientMessageId, replyToMessageId, answer, onInserted, stopSignal, replyContext })).turnId,
+            answer: (text, channel, replyToMessageId) => users.answer(text, { channel, replyToMessageId }),
+          });
+          const settle = async () => {
+            for (let round = 0; round < 12; round++) {
+              await service.drain();
+              await delay(5);
+            }
+          };
+          const inbound = async (text, root, extra = {}) => {
+            const id = ts('1700000000');
+            queue.push({ channelId: 'slack', accountId: 'TFIXTURE', senderId: 'UOWNER', threadId: 'DOWNER', installationId: config.installationId, conversationRootMessageId: root ?? id, messageId: id, text, sentAt: new Date(), ...(root ? { replyToMessageId: root } : {}), ...extra });
+            await settle();
+            const row = (await q('SELECT * FROM channel_inbox WHERE source_id=$1', ['channel:slack:TFIXTURE:' + id])).rows[0];
+            return { id, ...row, turn: row?.turn_id };
+          };
+          const status = (turn, value, reason = null) => q('UPDATE turns SET status=$2,waiting_reason=$3,started_at=COALESCE(started_at,now()) WHERE id=$1', [turn, value, reason]);
+          const send = async (turn, text) => {
+            const id = randomUUID();
+            await q("INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant',$5)", [id, ownerId, threadId, turn, text]);
+            for (let round = 0; round < 300; round++) {
+              await service.drain();
+              if ((await q('SELECT state FROM channel_outbox WHERE message_id=$1', [id])).rows[0]?.state === 'sent')
+                return { id, post: posts.find((post) => post.deliveryId === id) };
+              await delay(5);
+            }
+            assert.fail('The reply was not delivered.');
+          };
+          const stored = async (turn) => (await q("SELECT u.parent_turn_id,m.reply_to_message_id FROM turns u JOIN messages m ON m.turn_id=u.id AND m.role='user' WHERE u.id=$1", [turn])).rows[0];
+          const answered = async (turn) => {
+            await status(turn, 'running');
+            const verdict = await trust.check({ threadId, turnId: turn }, 'SYNTHETIC_SEND', { recipient: 'fixture@example.invalid', message: 'Synthetic' });
+            assert.equal(verdict.confirm, true);
+            return trustInputs.at(-1).assistantMessageBeforeLatestUserMessage;
+          };
+          const noTurn = async (root, text = 'Synthetic unroutable reply', extra = {}) => {
+            const reply = await inbound(text, root, extra);
+            assert.equal(reply.turn ?? null, null);
+            return reply;
+          };
+          const finish = () => q("UPDATE turns SET status='succeeded',waiting_reason=NULL WHERE owner_id=$1 AND status IN ('queued','running','waiting')", [ownerId]);
+
+          const request = await inbound('Synthetic request that needs approval');
+          await status(request.turn, 'running');
+          const question = randomUUID();
+          const approval = randomUUID();
+          await q("INSERT INTO messages(id,owner_id,role,text,thread_id,turn_id) VALUES($1,$2,'assistant','Synthetic approval question',$3,$4)", [question, ownerId, threadId, request.turn]);
+          await q("INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,confirmation_message_id) VALUES($1,$2,$3,$4,'SYNTHETIC_ACTION','{}','pending',$5,$6)", [approval, ownerId, threadId, request.turn, request.message_id, question]);
+          await status(request.turn, 'waiting', 'approval');
+          await settle();
+          const card = posts.find((post) => post.deliveryId === question);
+          assert.equal(card.rootMessageId, undefined);
+          for (const [state, streamed, deliveryOnly] of [['uncertain', false, false], ['sent', true, false], ['sent', false, true]]) {
+            await q('UPDATE channel_outbox SET state=$2,streamed=$3,delivery_only=$4 WHERE message_id=$1', [question, state, streamed, deliveryOnly]);
+            await noTurn(card.id, 'yes');
+            assert.equal(answerCalls, 0);
+            assert.equal((await q('SELECT status FROM approvals WHERE id=$1', [approval])).rows[0].status, 'pending');
+          }
+          await q("UPDATE channel_outbox SET state='sent',streamed=false,delivery_only=false WHERE message_id=$1", [question]);
+          const yes = await inbound('yes', card.id);
+          assert.equal(answerCalls, 1);
+          assert.equal((await q('SELECT status FROM approvals WHERE id=$1', [approval])).rows[0].status, 'confirmed');
+          assert.ok(yes.turn);
+          assert.equal((await q("SELECT count(*)::int AS n FROM approvals WHERE status='executed'")).rows[0].n, 0);
+
+          await finish();
+          const first = await inbound('Synthetic first conversation');
+          await status(first.turn, 'running');
+          const proposal = await send(first.turn, 'I can send the synthetic summary. Shall I send it?');
+          assert.equal(proposal.post.rootMessageId, first.id);
+          await status(first.turn, 'succeeded');
+          const second = await inbound('Synthetic second conversation');
+          await status(second.turn, 'waiting', 'question');
+          await send(second.turn, 'Synthetic second question');
+          const followUp = await inbound('Yes, do that', first.id);
+          assert.deepEqual(await stored(followUp.turn), { parent_turn_id: null, reply_to_message_id: proposal.id });
+          assert.equal(await answered(followUp.turn), 'I can send the synthetic summary. Shall I send it?');
+          assert.equal((await q('SELECT status FROM turns WHERE id=$1', [second.turn])).rows[0].status, 'waiting');
+
+          for (const change of ['sending', 'uncertain', 'delivery_only', 'hidden', 'withdrawn']) {
+            await finish();
+            const root = await inbound('Synthetic ' + change + ' conversation');
+            await status(root.turn, 'waiting', 'question');
+            const output = await send(root.turn, 'Synthetic current question');
+            if (change === 'sending' || change === 'uncertain') await q('UPDATE channel_outbox SET state=$2 WHERE message_id=$1', [output.id, change]);
+            if (change === 'delivery_only') await q('UPDATE channel_outbox SET delivery_only=true WHERE message_id=$1', [output.id]);
+            if (change === 'hidden') await q('UPDATE messages SET hidden_at=now() WHERE id=$1', [output.id]);
+            if (change === 'withdrawn') await q('UPDATE turns SET withdrawn=true WHERE id=$1', [root.turn]);
+            await noTurn(root.id);
+          }
+
+          for (const ended of ['failed', 'cancelled']) {
+            await finish();
+            const root = await inbound('Synthetic ' + ended + ' conversation');
+            await status(root.turn, 'waiting', 'question');
+            await send(root.turn, 'Synthetic question before the end');
+            await status(root.turn, ended);
+            const again = await inbound('Yes, do that', root.id);
+            assert.deepEqual(await stored(again.turn), { parent_turn_id: null, reply_to_message_id: null });
+            assert.equal((await q('SELECT no_reply_context FROM messages WHERE id=$1', [again.message_id])).rows[0].no_reply_context, true);
+            assert.equal(await answered(again.turn), undefined);
+          }
+
+          await finish();
+          const plain = await inbound('Synthetic top-level conversation');
+          await status(plain.turn, 'running');
+          config.rich = false;
+          const topLevel = await send(plain.turn, 'I can send the synthetic invoice. Shall I send it?');
+          config.rich = true;
+          assert.equal(posts.at(-1).rootMessageId, undefined);
+          await status(plain.turn, 'succeeded');
+          const topLevelYes = await inbound('Yes, do that');
+          assert.equal(await answered(topLevelYes.turn), 'I can send the synthetic invoice. Shall I send it?');
+          await finish();
+          await q("UPDATE channel_outbox SET state='uncertain' WHERE message_id=$1", [topLevel.id]);
+          const uncertainYes = await inbound('Yes, do that');
+          assert.equal(await answered(uncertainYes.turn), undefined);
+          await finish();
+          const threaded = await inbound('Synthetic threaded conversation');
+          await status(threaded.turn, 'running');
+          const inThread = await send(threaded.turn, 'I can send the synthetic report. Shall I send it?');
+          assert.equal(inThread.post.rootMessageId, threaded.id);
+          await status(threaded.turn, 'succeeded');
+          const threadedYes = await inbound('Yes, do that');
+          assert.deepEqual(await stored(threadedYes.turn), { parent_turn_id: null, reply_to_message_id: null });
+          assert.equal((await q('SELECT no_reply_context FROM messages WHERE id=$1', [threadedYes.message_id])).rows[0].no_reply_context, false);
+          assert.equal(await answered(threadedYes.turn), undefined);
+
+          await finish();
+          const owned = await inbound('Synthetic identity conversation');
+          await status(owned.turn, 'waiting', 'question');
+          await send(owned.turn, 'Synthetic identity question');
+          await noTurn(owned.id, 'Synthetic foreign sender', { senderId: 'UFOREIGN' });
+          await noTurn(owned.id, 'Synthetic other installation', { installationId: 'other-installation' });
+          await noTurn(owned.id, 'Synthetic other conversation', { threadId: 'DOTHER' });
+          await noTurn('DOWNER:1700000099.999997');
+          assert.equal(answerCalls, 1);
+        } finally {
+          await service?.close().catch(() => {});
+          await thread.stopThreadWorkers().catch(() => {});
+          await db.pool.end();
+          await admin.query('DROP SCHEMA IF EXISTS ' + schema + '_boss CASCADE');
+          await admin.query('DROP SCHEMA IF EXISTS ' + schema + ' CASCADE');
+          await admin.end();
+          await rm(data, { recursive: true, force: true });
+        }
+      `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  },
+);

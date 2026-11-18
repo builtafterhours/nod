@@ -292,6 +292,17 @@ export interface TaskWait {
   who: string;
   via: string;
 }
+export type TaskPlan = {
+  taskId: string;
+  planRevision: number;
+  progressRevision: number;
+} & (
+  | { kind: 'legacy'; state: 'unknown' }
+  | {
+      kind: 'structured';
+      steps: Array<{ id: string; title: string; state: 'pending' | 'started' }>;
+    }
+);
 export interface Task {
   id: string;
   title: string;
@@ -312,6 +323,7 @@ export interface Task {
   stepIndex?: number;
   revision?: number;
   appliedRevision?: number;
+  plan?: TaskPlan;
   model?: ModelSelection | null;
   work?: WorkKind;
   scheduleModel?: ModelSelection;
@@ -397,7 +409,7 @@ export interface Preferences {
   proactivePaused: boolean;
   localFilesEnabled: boolean;
 }
-export type ChannelProvider = 'telegram' | 'whatsapp';
+export type ChannelProvider = 'telegram' | 'whatsapp' | 'slack';
 export interface ChannelLinkStatus {
   pairingId?: string;
   state:
@@ -415,12 +427,13 @@ export interface ChannelLinkStatus {
   error?: string;
 }
 export interface ChannelSetupSummary {
+  richEnabled?: boolean;
   provider: ChannelProvider;
   enabled: boolean;
   managed?: boolean;
   accountName?: string;
   accountHandle?: string;
-  mode?: 'polling' | 'webhook' | 'linked';
+  mode?: 'polling' | 'webhook' | 'linked' | 'socket';
   linkMode?: 'bot' | 'self-chat';
   connectionState?: ChannelLinkStatus['state'];
   webhookStatus?: 'registered' | 'manual_setup' | 'registration_pending';

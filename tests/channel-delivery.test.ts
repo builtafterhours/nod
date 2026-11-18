@@ -10,8 +10,10 @@ import Fastify from 'fastify';
 import pg from 'pg';
 import type { ChannelSetupConfiguration } from '../src/ports/channel-settings.ts';
 import type { InboundMessage, MessagingTransport } from '../src/ports/messaging.ts';
-import { MessagingConnectionError } from '../src/ports/messaging.ts';
+import { MessagingConnectionError, MessagingDeliveryError } from '../src/ports/messaging.ts';
 import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
+import { createSlackTransport } from '../src/providers/chat-sdk/slack.ts';
+import { SocketModeClient } from '@slack/socket-mode';
 import { createChatSdkSetupVerifier } from '../src/providers/chat-sdk/settings.ts';
 import {
   channelConnectionObservations,
@@ -4205,3 +4207,227 @@ test(
     }
   },
 );
+
+const slackEnvironment = {
+  SLACK_ENABLED: 'true',
+  SLACK_BOT_TOKEN: 'xoxb-fixture-never-live',
+  SLACK_APP_TOKEN: 'xapp-fixture-never-live',
+  SLACK_TEAM_ID: 'TFIXTURE',
+  SLACK_ALLOWED_USER_ID: 'UOWNER',
+};
+
+function slackFixture(t: TestContext) {
+  const calls: Array<{ method: string; body: Record<string, string> }> = [];
+  let sequence = 0;
+  const responses = new Map<string, Array<(() => Promise<Response>) | undefined>>();
+  const answers: Record<string, Record<string, unknown>> = {
+    'auth.test': { team_id: 'TFIXTURE', bot_id: 'BFIXTURE', user_id: 'UBOT' },
+    'bots.info': { bot: { app_id: 'AFIXTURE' } },
+    'users.info': { user: { id: 'UOWNER', team_id: 'TFIXTURE' } },
+    'conversations.open': { channel: { id: 'DOWNER' } },
+    'conversations.info': { channel: { is_im: true, user: 'UOWNER' } },
+  };
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    assert.equal(url.origin, 'https://slack.com');
+    const method = url.pathname.split('/').at(-1)!;
+    const body = Object.fromEntries(new URLSearchParams(String(init?.body ?? '')));
+    calls.push({ method, body });
+    const next = responses.get(method)?.shift();
+    if (next) return next();
+    if (method in answers) return Response.json({ ok: true, ...answers[method] });
+    assert.equal(method, 'chat.postMessage');
+    return Response.json({ ok: true, ts: `1700000100.${String(++sequence).padStart(6, '0')}` });
+  });
+  const sockets: SocketModeClient[] = [];
+  const starts = t.mock.method(
+    SocketModeClient.prototype,
+    'start',
+    async function (this: SocketModeClient) {
+      sockets.push(this);
+      this.emit('connected');
+      return { ok: true } as never;
+    },
+  );
+  const emit = (type: string, body: unknown) => {
+    let acks = 0;
+    sockets.at(-1)!.emit('slack_event', {
+      type,
+      body,
+      ack: async () => {
+        acks++;
+      },
+    });
+    return () => acks;
+  };
+  return { calls, responses, starts, emit, answers };
+}
+
+test('Slack accepts only the allowed owner direct messages and acknowledges each only after intake', async (t) => {
+  const slack = slackFixture(t);
+  const transport = createSlackTransport(
+    { query: async () => assert.fail('Message intake must not need the database.') } as never,
+    slackEnvironment,
+  );
+  try {
+    await transport.poll!(async () => assert.fail('No message arrived.'));
+    await until(() => transport.channels[0].available === true);
+    const envelope = (eventId: string, event: Record<string, unknown>, outer = {}) => ({
+      team_id: 'TFIXTURE',
+      api_app_id: 'AFIXTURE',
+      event_id: eventId,
+      event: {
+        type: 'message',
+        user: 'UOWNER',
+        channel: 'DOWNER',
+        channel_type: 'im',
+        ts: '1700000000.000001',
+        text: 'Synthetic private request',
+        ...event,
+      },
+      ...outer,
+    });
+    const dropped = [
+      envelope('EvForeignUser', { user: 'UFOREIGN' }),
+      envelope('EvForeignTeam', {}, { team_id: 'TFOREIGN' }),
+      envelope('EvForeignApp', {}, { api_app_id: 'AFOREIGN' }),
+      envelope('EvBot', { bot_id: 'BOTHER' }),
+      envelope('EvChannel', { channel: 'CPUBLIC', channel_type: 'channel' }),
+      envelope('EvGroup', { channel_type: 'mpim' }),
+      envelope('EvEdited', { subtype: 'message_changed' }),
+      envelope('EvMention', { type: 'app_mention' }),
+    ];
+    const droppedAcks = dropped.map((body) => slack.emit('events_api', body));
+    droppedAcks.push(slack.emit('slash_commands', envelope('EvSlash', {})));
+    const ownerAcks = slack.emit('events_api', envelope('EvOwner', {}));
+    const stopAcks = slack.emit(
+      'events_api',
+      envelope('EvStop', {
+        ts: '1700000000.000002',
+        thread_ts: '1700000000.000001',
+        text: 'nod stop',
+      }),
+    );
+    await until(() => droppedAcks.every((acks) => acks() === 1));
+    assert.equal(ownerAcks(), 0);
+    await assert.rejects(
+      transport.poll!(async () => {
+        throw new Error('Synthetic intake failure.');
+      }),
+      /Synthetic intake failure/,
+    );
+    assert.equal(ownerAcks(), 0);
+    const accepted: InboundMessage[] = [];
+    await transport.poll!(async (message) => {
+      assert.equal(ownerAcks() + stopAcks(), accepted.length);
+      accepted.push(message);
+    });
+    assert.deepEqual(
+      accepted.map(({ sentAt: _sentAt, installationId, ...message }) => {
+        assert.match(installationId ?? '', /^[0-9a-f]{64}$/);
+        return message;
+      }),
+      [
+        {
+          channelId: 'slack',
+          accountId: 'TFIXTURE',
+          senderId: 'UOWNER',
+          messageId: 'DOWNER:1700000000.000001',
+          threadId: 'DOWNER',
+          conversationRootMessageId: 'DOWNER:1700000000.000001',
+          text: 'Synthetic private request',
+        },
+        {
+          channelId: 'slack',
+          accountId: 'TFIXTURE',
+          senderId: 'UOWNER',
+          messageId: 'DOWNER:1700000000.000002',
+          threadId: 'DOWNER',
+          conversationRootMessageId: 'DOWNER:1700000000.000001',
+          text: '/stop',
+          replyToMessageId: 'DOWNER:1700000000.000001',
+        },
+      ],
+    );
+    assert.deepEqual([ownerAcks(), stopAcks()], [1, 1]);
+    await transport.poll!(async () => assert.fail('An acknowledged message was delivered again.'));
+  } finally {
+    await transport.close();
+  }
+});
+
+test('Slack refuses to connect when the token, owner or direct message is not the configured one', async (t) => {
+  const slack = slackFixture(t);
+  for (const [answer, value] of [
+    ['users.info', { user: { id: 'UOWNER', team_id: 'TFIXTURE', is_bot: true } }],
+    ['users.info', { user: { id: 'UOWNER', team_id: 'TOTHER' } }],
+    ['conversations.info', { channel: { is_im: true, is_ext_shared: true, user: 'UOWNER' } }],
+    ['conversations.info', { channel: { is_im: true, user: 'UOTHER' } }],
+    ['auth.test', { team_id: 'TOTHER', bot_id: 'BFIXTURE', user_id: 'UBOT' }],
+  ] as const) {
+    const original = slack.answers[answer];
+    slack.answers[answer] = value;
+    const transport = createSlackTransport({} as never, slackEnvironment);
+    try {
+      await transport.poll!(async () => assert.fail('No message arrived.'));
+      await until(() => Boolean(transport.channels[0].error));
+      assert.equal(transport.channels[0].available, false);
+      assert.match(
+        transport.channels[0].error!,
+        /^Slack failed: [a-z_]+\. Reconnect in Channels\.$/,
+      );
+      assert.equal(slack.starts.mock.callCount(), 0);
+    } finally {
+      await transport.close();
+      slack.answers[answer] = original;
+    }
+  }
+});
+
+test('Slack reports a partly sent reply as uncertain with its delivered message and never resends it', async (t) => {
+  const slack = slackFixture(t);
+  const transport = createSlackTransport({} as never, slackEnvironment);
+  try {
+    await transport.poll!(async () => assert.fail('No message arrived.'));
+    await until(() => transport.channels[0].available === true);
+    for (const target of [
+      { accountId: 'TFIXTURE', threadId: 'DOTHER' },
+      { accountId: 'TOTHER', threadId: 'DOWNER' },
+    ])
+      await assert.rejects(
+        transport.post({ channelId: 'slack', ...target, text: 'Synthetic private reply' }),
+        MessagingConnectionError,
+      );
+    assert.equal(slack.calls.filter((call) => call.method === 'chat.postMessage').length, 0);
+    slack.responses.set('chat.postMessage', [
+      undefined,
+      async () => {
+        throw new TypeError('fetch failed', {
+          cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+        });
+      },
+    ]);
+    const text = Array.from(
+      { length: 10 },
+      (_, index) => `Synthetic paragraph ${index} ${'word '.repeat(80)}`,
+    ).join('\n\n');
+    const failure = await transport
+      .post({ channelId: 'slack', accountId: 'TFIXTURE', threadId: 'DOWNER', text })
+      .then(
+        () => assert.fail('A partly sent reply was reported as delivered.'),
+        (error: unknown) => error,
+      );
+    assert.ok(failure instanceof MessagingDeliveryError);
+    assert.equal(failure.message, 'Slack failed: network_request_failed (ECONNRESET).');
+    assert.deepEqual(failure.ids, ['DOWNER:1700000100.000001']);
+    const posts = slack.calls.filter((call) => call.method === 'chat.postMessage');
+    assert.equal(posts.length, 2);
+    for (const post of posts) {
+      assert.equal(post.body.channel, 'DOWNER');
+      assert.equal(post.body.unfurl_links, 'false');
+      assert.equal(post.body.link_names, 'false');
+    }
+  } finally {
+    await transport.close();
+  }
+});

@@ -55,6 +55,14 @@ Each turn sees up to 100 tasks of the active conversation, open ones first, then
 
 A model-written task list in the workspace does not replace the ledger. The existing turn queue runs the sessions. The task system does not add another scheduler or cost ledger.
 
+### Plan intent and progress
+
+A task can store a structured plan of up to 50 step titles, each at most 200 characters, where some characters, such as many emoji, count as two or more. Longer input is rejected, not truncated. Each step starts **pending**, and the task marks a step **started** when it begins that work. These record intent, not outcomes: there are no completed or failed steps, and finishing, waiting or failing a task completes none of them. Older plans saved as plain text stay readable, with their step state shown as unknown.
+
+Plan changes use the normal turn lock and Stop. Each write must name the plan's current revisions and come from the task's current turn and owner instruction, so a stale, conflicting or repeated write fails and is not retried. Replacing a changed plan gives every step a new ID and resets it to pending. For new multi-step tasks, the task tool asks Pi to save a structured plan and mark each step started explicitly; tool activity alone never marks a step started.
+
+Rich Slack task views show only step numbers and pending or reported-start state, never step titles or internal IDs. While the task runs, an optional **Reported starts** strip lists the started steps; it is not a progress meter. A view is checked against the current task, turn and plan before it is sent, and a stale one is dropped. An uncertain delivery never resends the view or changes the task. Other channels keep their existing views.
+
 ## Start, reply and finish
 
 1. The owner gives the coordinator an independent goal. The coordinator uses `task start` with a title, completion condition, brief and planned steps.

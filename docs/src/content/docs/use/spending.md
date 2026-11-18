@@ -125,9 +125,9 @@ Tell Nod in chat, for example "Check in when a task passes $20" or "Stop checkin
 Nod finishes an action that has already started before it checks in. If the model keeps trying to work after the check-in, Nod pauses and waits for you with a notice such as **Paused at the $5 check-in. Reply to keep going.** The task shows **Needs you**, and your reply continues it. The background observer works the same way: its checks resume once you reply.
 :::
 
-## Check usage from Telegram or WhatsApp
+## Check usage from a chat app
 
-Send `/usage` for a summary written by your selected model. That model call counts toward usage. Telegram and the WhatsApp QR connection also receive this month's statement as a PDF. With the WhatsApp Cloud API, open Nod to get it.
+Send `/usage` (`nod usage` in Slack) for a summary written by your selected model. That model call counts toward usage. Telegram, Slack and the WhatsApp QR connection also receive this month's statement as a PDF. With the WhatsApp Cloud API, open Nod to get it.
 
 ## Ask Nod
 

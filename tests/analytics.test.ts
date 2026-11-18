@@ -46,7 +46,7 @@ test('channel reconnect analytics count only accepted requests with bounded prop
     reply.code(fail ? 503 : 200).send({ ok: !fail }),
   );
   try {
-    for (const provider of ['telegram', 'whatsapp']) {
+    for (const provider of ['telegram', 'whatsapp', 'slack']) {
       assert.equal(
         (
           await app.inject({
@@ -68,7 +68,7 @@ test('channel reconnect analytics count only accepted requests with bounded prop
     await app.inject({ method: 'POST', url: '/api/channel-settings/private-provider/reconnect' });
     assert.deepEqual(
       events,
-      ['telegram', 'whatsapp'].map((channel) => ({
+      ['telegram', 'whatsapp', 'slack'].map((channel) => ({
         event: 'settings_updated',
         properties: { section: 'channels', operation: 'connect_started', channel },
       })),

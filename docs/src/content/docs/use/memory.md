@@ -101,9 +101,9 @@ Note and skill edits appear in the Settings save review. Save or discard them be
 
 You can also tell Nod in chat, for example "forget my old address" or "stop remembering things".
 
-## Check memory from Telegram or WhatsApp
+## Check memory from a chat app
 
-Send `/memory` (or `/context`) for a short summary written by your selected model. That model call counts toward usage. Telegram and the WhatsApp QR connection also receive the full export as a document. With the WhatsApp Cloud API, open Nod to get it.
+Send `/memory` (or `/context`; `nod memory` in Slack) for a short summary written by your selected model. That model call counts toward usage. Telegram, Slack and the WhatsApp QR connection also receive the full export as a document. With the WhatsApp Cloud API, open Nod to get it.
 
 ## Memory is context, not permission
 

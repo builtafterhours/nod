@@ -36,6 +36,8 @@ import {
   createErrorRedactor,
   createRedactor,
   createTextRedactor,
+  environmentSecrets,
+  redactSecretText,
 } from '../src/server/redaction.ts';
 
 test('decision reservations release only requests that did not reach dispatch', async () => {
@@ -2606,6 +2608,41 @@ test('secret redaction keeps valid tokens when another token is missing', () => 
   assert.equal(
     JSON.stringify(redact({ detail: 'fixture-refresh-token' })),
     '{"detail":"[redacted]"}',
+  );
+});
+
+test('Slack app and bot tokens stay out of text, objects and environment-derived secrets', () => {
+  const bot = 'xoxb-1234567890-synthetic-bot-value';
+  const app = 'xapp-synthetic-app-level-value';
+  assert.equal(
+    redactSecretText(`Slack failed for ${bot} and ${app}.`),
+    'Slack failed for [redacted] and [redacted].',
+  );
+  assert.equal(
+    redactSecretText('appToken=opaque-app-value app_token: opaque-app-value'),
+    'appToken=[redacted] app_token: [redacted]',
+  );
+  assert.equal(
+    JSON.stringify(
+      createRedactor([])({
+        appToken: 'opaque-app-value',
+        botToken: 'opaque-bot-value',
+        team: 'T1',
+      }),
+    ),
+    '{"appToken":"[redacted]","botToken":"[redacted]","team":"T1"}',
+  );
+  const secrets = environmentSecrets({
+    SLACK_ENABLED: 'true',
+    SLACK_BOT_TOKEN: 'opaque-bot-value',
+    SLACK_APP_TOKEN: 'opaque-app-value',
+    SLACK_TEAM_ID: 'TSYNTHETIC',
+    SLACK_ALLOWED_USER_ID: 'USYNTHETIC',
+  });
+  assert.deepEqual(secrets.sort(), ['opaque-app-value', 'opaque-bot-value']);
+  assert.equal(
+    createErrorRedactor(secrets)('Socket Mode refused opaque-app-value for opaque-bot-value.'),
+    'Socket Mode refused [redacted] for [redacted].',
   );
 });
 
