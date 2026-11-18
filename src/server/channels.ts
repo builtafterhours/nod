@@ -13,7 +13,7 @@ import { languageText } from './communication.ts';
 import { ChannelMediaFailure, type ChannelMedia } from './channel-media.ts';
 import type { WorkAdmission } from './work-admission.ts';
 import type { LiveWork } from './activity.ts';
-import { MessagingConnectionError } from '../ports/messaging.ts';
+import { MessagingConnectionError, MessagingDeliveryError } from '../ports/messaging.ts';
 import type {
   ChannelPairingRequest,
   InboundMessage,
@@ -481,7 +481,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         `SELECT m.id FROM messages m JOIN threads th ON th.id=m.thread_id
          WHERE m.owner_id=$5 AND th.owner_id=$5 AND th.archived_at IS NULL AND m.role='assistant' AND m.hidden_at IS NULL AND m.id IN (
            SELECT o.message_id FROM channel_outbox o JOIN channel_inbox i ON i.source_id=o.source_id
-           WHERE $4=ANY(o.provider_message_ids) AND o.state='sent'
+           WHERE $4=ANY(o.provider_message_ids) AND o.state IN ('sent','uncertain')
              AND i.provider=$1 AND i.account_id=$2 AND i.sender_id=$3 AND i.owner_id=$5)
          LIMIT 1`,
         [channelId, accountId, senderId, messageId, ownerId],
@@ -560,7 +560,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         `SELECT o.message_id FROM channel_outbox o JOIN channel_inbox i ON i.source_id=o.source_id
          JOIN messages m ON m.id=o.message_id AND m.owner_id=i.owner_id
          WHERE i.owner_id=$1 AND i.provider=$2 AND i.account_id=$3 AND i.sender_id=$4
-           AND i.thread_id=$5 AND $6=ANY(o.provider_message_ids) AND o.state='sent'
+           AND i.thread_id=$5 AND $6=ANY(o.provider_message_ids) AND o.state IN ('sent','uncertain')
          UNION ALL
          SELECT message_id FROM channel_inbox WHERE owner_id=$1 AND provider=$2 AND account_id=$3
            AND sender_id=$4 AND thread_id=$5 AND source_id=$7 AND state='submitted'
@@ -1462,13 +1462,15 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     } catch (cause) {
       logFailure('channel_send_failed', cause);
       await pool.query(
-        `UPDATE channel_outbox SET state=$3,reason=$4,claim_id=NULL,updated_at=now()
+        `UPDATE channel_outbox SET state=$3,reason=$4,provider_message_id=$5,provider_message_ids=$6,claim_id=NULL,updated_at=now()
          WHERE message_id=$1 AND claim_id=$2 AND state='sending'`,
         [
           row.message_id,
           claimId,
           postStarted ? 'uncertain' : 'pending',
           postStarted ? 'send_not_confirmed' : null,
+          cause instanceof MessagingDeliveryError ? (cause.ids[0] ?? null) : null,
+          cause instanceof MessagingDeliveryError ? cause.ids : [],
         ],
       );
       if (!postStarted) return false;
@@ -1923,6 +1925,13 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     replaceTransport,
     announcePairing,
     react,
+    available(provider: string) {
+      return (
+        !closed &&
+        !replacing &&
+        transport.channels.find((channel) => channel.id === provider)?.available
+      );
+    },
     async pairing() {
       if (closed || replacing || !transport.pairing) throw new Error('QR pairing is unavailable.');
       return transport.pairing();

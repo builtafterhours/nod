@@ -60,6 +60,7 @@ function managedConfigurationReady(provider: ChannelProvider, values: Record<str
 export function channelConnectionObservations(
   channels: ChannelSetupSummary[],
   managed: Partial<Record<ChannelProvider, Record<string, string>>> = {},
+  slackAvailable?: boolean,
 ): ChannelConnectionObservation[] {
   const telegram = channels.find((channel) => channel.provider === 'telegram');
   const whatsapp = channels.find((channel) => channel.provider === 'whatsapp');
@@ -96,7 +97,9 @@ export function channelConnectionObservations(
           ? ('disabled' as const)
           : managed.slack && !managedConfigurationReady('slack', managed.slack)
             ? ('setup_pending' as const)
-            : ('configured_unverified' as const),
+            : slackAvailable
+              ? ('connected' as const)
+              : ('configured_unverified' as const),
       })),
   ];
 }
@@ -373,6 +376,7 @@ export async function createChannelSettings(
     managed?: ReturnType<typeof managedChannelEnvironment>;
     apply(environment: Record<string, string>): Promise<void>;
     linkStatus?(): Promise<ChannelLinkStatus>;
+    available?(provider: ChannelProvider): boolean | undefined;
     cancelPairing?(pairingId: string, restart?: boolean): Promise<boolean>;
     unlink?(): Promise<void>;
     paired?(candidate: TelegramPairingCandidate, client: PoolClient): Promise<() => void>;
@@ -470,7 +474,9 @@ export async function createChannelSettings(
     };
     if (sequence === statusObservationSequence) {
       try {
-        observed?.(channelConnectionObservations(result.channels, managed));
+        observed?.(
+          channelConnectionObservations(result.channels, managed, options.available?.('slack')),
+        );
       } catch {}
     }
     return result;

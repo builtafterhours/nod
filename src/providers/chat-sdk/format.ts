@@ -1,4 +1,5 @@
 import { parseMarkdown, type Root } from 'chat';
+import { MessagingConnectionError } from '../../ports/messaging.ts';
 
 type Node = Root | Root['children'][number];
 type Parent = Extract<Node, { children: unknown }>;
@@ -201,11 +202,11 @@ export function whatsappText(markdown: string) {
   return render(parseMarkdown(markdown), whatsapp, markdown);
 }
 
-export function slackText(markdown: string) {
+export function slackText(markdown: string | Root) {
   const escape = (value: string) =>
     value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
   return render(
-    parseMarkdown(markdown),
+    typeof markdown === 'string' ? parseMarkdown(markdown) : markdown,
     {
       ...whatsapp,
       text: escape,
@@ -213,6 +214,79 @@ export function slackText(markdown: string) {
       block: (value) => `\`\`\`\n${escape(value).replaceAll('```', "'''")}\n\`\`\``,
       link: (label, url) => `<${escape(url).replaceAll('|', '%7C')}|${label.replaceAll('|', ' ')}>`,
     },
-    markdown,
+    typeof markdown === 'string' ? markdown : undefined,
   );
+}
+
+export function slackMessages(markdown: string) {
+  const limit = 3000;
+  const text = slackText(markdown);
+  if (text.length <= limit) return text ? [text] : [];
+  const root = parseMarkdown(markdown);
+  const split = (node: Node, wrap: (part: Node) => Root): Node[] => {
+    const length = (part: Node) => slackText(wrap(part)).length;
+    if (length(node) <= limit) return [node];
+    if (
+      node.type === 'image' ||
+      (node.type === 'link' && length({ ...node, children: [] }) > limit - 100)
+    ) {
+      const label = node.type === 'image' ? node.alt || 'Image' : plain(node);
+      return split(
+        {
+          type: 'text',
+          value: [label, `mailto:${label}`].includes(node.url) ? label : `${label} (${node.url})`,
+        } as Node,
+        wrap,
+      );
+    }
+    if ('children' in node) {
+      const parts: Node[] = [];
+      let children: Node[] = [];
+      const withChildren = (values: Node[]) => ({ ...node, children: values }) as Node;
+      for (const child of node.children as Node[]) {
+        for (const part of split(child, (value) => wrap(withChildren([value])))) {
+          if (children.length && length(withChildren([...children, part])) > limit) {
+            parts.push(withChildren(children));
+            children = [];
+          }
+          children.push(part);
+        }
+      }
+      if (children.length) parts.push(withChildren(children));
+      return parts;
+    }
+    if ('value' in node && typeof node.value === 'string') {
+      const points = Array.from(node.value);
+      const parts: Node[] = [];
+      let offset = 0;
+      while (offset < points.length) {
+        const part = (count: number) =>
+          ({
+            ...node,
+            value: points.slice(offset, offset + count).join(''),
+          }) as Node;
+        let low = 0;
+        let high = Math.min(points.length - offset, limit);
+        while (low < high) {
+          const mid = Math.ceil((low + high) / 2);
+          if (length(part(mid)) <= limit) low = mid;
+          else high = mid - 1;
+        }
+        if (!low) throw new MessagingConnectionError('Slack failed: text_format_limit.');
+        if (offset + low < points.length) {
+          const candidate = points.slice(offset, offset + low);
+          let boundary = candidate.lastIndexOf('\n');
+          if (boundary < low / 2) boundary = candidate.lastIndexOf(' ');
+          if (boundary >= low / 2) low = boundary + 1;
+        }
+        parts.push(part(low));
+        offset += low;
+      }
+      return parts;
+    }
+    throw new MessagingConnectionError('Slack failed: text_format_limit.');
+  };
+  return split(root, (part) => part as Root)
+    .map((part) => slackText(part as Root))
+    .filter(Boolean);
 }

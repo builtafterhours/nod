@@ -3,6 +3,7 @@ import { SocketModeClient, LogLevel } from '@slack/socket-mode';
 import {
   WebClient,
   WebAPIHTTPError,
+  WebAPIRequestError,
   WebAPIPlatformError,
   WebAPIRateLimitedError,
 } from '@slack/web-api';
@@ -16,19 +17,32 @@ import type {
   MessagingChannel,
   MessagingTransport,
 } from '../../ports/messaging.ts';
-import { MessagingAttachmentError, MessagingConnectionError } from '../../ports/messaging.ts';
+import {
+  MessagingAttachmentError,
+  MessagingConnectionError,
+  MessagingDeliveryError,
+} from '../../ports/messaging.ts';
 import { isMessageReaction } from '../../shared/emoji.ts';
-import { slackText } from './format.ts';
+import { slackMessages } from './format.ts';
 
 const id = /^[A-Z][A-Z0-9]{1,63}$/;
 const timestamp = /^\d{10,16}\.\d{6}$/;
 const fileLimit = 20 * 1024 * 1024;
+const emojiAliases: Record<string, string> = {
+  thinking_face: 'thinking',
+  hugging_face: 'hugs',
+  face_with_rolling_eyes: 'roll_eyes',
+};
 
 function reactionEmoji(name: string) {
   const parsed = /^([a-z0-9_+-]+)(?:::skin-tone-([2-6]))?$/.exec(name);
   if (!parsed) return undefined;
   const base = emojiForName(
-    parsed[1] === 'thumbsup' ? '+1' : parsed[1] === 'thumbsdown' ? '-1' : parsed[1],
+    parsed[1] === 'thumbsup'
+      ? '+1'
+      : parsed[1] === 'thumbsdown'
+        ? '-1'
+        : (emojiAliases[parsed[1]] ?? parsed[1]),
   );
   return base && base + (parsed[2] ? String.fromCodePoint(0x1f3f9 + Number(parsed[2])) : '');
 }
@@ -37,7 +51,9 @@ function reactionName(emoji: string) {
   const base = nameForEmoji(emoji);
   if (!base) return undefined;
   const modifier = /\p{Emoji_Modifier}$/u.exec(emoji)?.[0];
-  const name = base + (modifier ? `::skin-tone-${modifier.codePointAt(0)! - 0x1f3f9}` : '');
+  const name =
+    (Object.keys(emojiAliases).find((name) => emojiAliases[name] === base) ?? base) +
+    (modifier ? `::skin-tone-${modifier.codePointAt(0)! - 0x1f3f9}` : '');
   return reactionEmoji(name)?.replaceAll('\uFE0F', '') === emoji.replaceAll('\uFE0F', '')
     ? name
     : undefined;
@@ -83,7 +99,9 @@ function failure(error: unknown) {
         ? `HTTP ${error.statusCode}`
         : error instanceof WebAPIRateLimitedError
           ? `rate_limited (retry after ${Math.min(86400, Math.max(0, error.retryAfter))} seconds)`
-          : 'connection_failed';
+          : error instanceof WebAPIRequestError
+            ? 'network_request_failed'
+            : 'connection_failed';
   return new MessagingConnectionError(`Slack failed: ${reason}.`);
 }
 
@@ -110,6 +128,17 @@ class SlackSocket extends SocketModeClient {
     super(options);
   }
 
+  override async start() {
+    try {
+      return await super.start();
+    } catch (error) {
+      const cause = failure(error);
+      await this.disconnect().catch(() => {});
+      this.emit('nod_start_failed', cause);
+      return { ok: false };
+    }
+  }
+
   protected override async onWebSocketMessage(
     ...args: Parameters<SocketModeClient['onWebSocketMessage']>
   ) {
@@ -125,7 +154,12 @@ class SlackSocket extends SocketModeClient {
     } catch {
       return;
     }
-    await super.onWebSocketMessage(...args);
+    try {
+      await super.onWebSocketMessage(...args);
+    } catch (error) {
+      await this.disconnect().catch(() => {});
+      this.emit('nod_start_failed', failure(error));
+    }
   }
 }
 
@@ -139,6 +173,7 @@ function socket(
     {
       appToken,
       logger,
+      autoReconnectEnabled: false,
       clientOptions: {
         retryConfig: { retries: 0 },
         rejectRateLimitedCalls: true,
@@ -156,18 +191,30 @@ function socket(
 }
 
 async function connect(connection: SlackSocket, signal: AbortSignal) {
+  let cleanup = () => {};
   const connected = new Promise<void>((resolve, reject) => {
+    const failed = (error: Error) => reject(error);
+    const identityFailed = () =>
+      reject(new MessagingConnectionError('Slack failed: app_identity_mismatch.'));
+    const aborted = () =>
+      reject(new MessagingConnectionError('Slack failed: connection_cancelled.'));
     connection.once('connected', resolve);
-    connection.once('nod_identity_failed', () =>
-      reject(new MessagingConnectionError('Slack failed: app_identity_mismatch.')),
-    );
-    signal.addEventListener(
-      'abort',
-      () => reject(new MessagingConnectionError('Slack failed: connection_cancelled.')),
-      { once: true },
-    );
+    connection.once('nod_start_failed', failed);
+    connection.once('nod_identity_failed', identityFailed);
+    signal.addEventListener('abort', aborted, { once: true });
+    cleanup = () => {
+      connection.removeListener('connected', resolve);
+      connection.removeListener('nod_start_failed', failed);
+      connection.removeListener('nod_identity_failed', identityFailed);
+      signal.removeEventListener('abort', aborted);
+    };
+    if (signal.aborted) aborted();
   });
-  await Promise.all([connection.start(), connected]);
+  try {
+    await Promise.all([connection.start(), connected]);
+  } finally {
+    cleanup();
+  }
 }
 
 async function identity(web: WebClient, input: z.infer<typeof slackInput>) {
@@ -263,7 +310,7 @@ const eventSchema = z.object({
     ts: z.string().optional(),
     thread_ts: z.string().optional(),
     text: z.string().max(100_000).optional(),
-    files: z.array(fileSchema).max(10).optional(),
+    files: z.array(z.unknown()).max(10).optional(),
     reaction: z.string().max(100).optional(),
     event_ts: z.string().regex(timestamp).optional(),
     item: z
@@ -273,7 +320,12 @@ const eventSchema = z.object({
 });
 
 function fileUrl(value: string | undefined, upload = false) {
-  const url = new URL(value ?? '');
+  let url: URL;
+  try {
+    url = new URL(value ?? '');
+  } catch {
+    throw new MessagingConnectionError('Slack failed: file_address_unavailable.');
+  }
   if (
     url.protocol !== 'https:' ||
     url.username ||
@@ -318,6 +370,9 @@ export function createSlackTransport(
   let connection: SlackSocket | undefined;
   let verified: Awaited<ReturnType<typeof identity>> | undefined;
   let starting: Promise<void> | undefined;
+  let replacementNeeded = false;
+  let attempts = 0;
+  let nextAttempt = 0;
   let closed = false;
   const incoming = new Map<
     string,
@@ -382,9 +437,31 @@ export function createSlackTransport(
     };
   }
 
+  function incomingAttachment(value: unknown): MessagingAttachment {
+    const file = fileSchema.safeParse(value);
+    if (file.success) return attachment(file.data);
+    return {
+      name: 'Unavailable Slack file',
+      mimeType: 'application/octet-stream',
+      size: 0,
+      async read() {
+        throw new MessagingConnectionError('Slack failed: file_metadata_unavailable.');
+      },
+    };
+  }
+
   async function start() {
     if (closed || !parsed.success || !enabled || starting) return starting;
+    if (replacementNeeded) {
+      await connection?.disconnect().catch(() => {});
+      connection?.removeAllListeners();
+      connection = undefined;
+      replacementNeeded = false;
+    }
     if (connection) return;
+    if (attempts >= 5 || Date.now() < nextAttempt) return;
+    attempts++;
+    nextAttempt = Date.now() + Math.min(30_000, 2000 * 2 ** (attempts - 1));
     starting = (async () => {
       try {
         verified = await identity(web!, parsed.data);
@@ -394,12 +471,21 @@ export function createSlackTransport(
           if (!closed) {
             channel.available = true;
             channel.error = undefined;
+            attempts = 0;
           }
         });
-        for (const event of ['disconnected', 'reconnecting'])
-          connection.on(event, () => {
-            channel.available = false;
-          });
+        connection.on('disconnected', () => {
+          channel.available = false;
+          replacementNeeded = true;
+        });
+        connection.on('reconnecting', () => {
+          channel.available = false;
+        });
+        connection.on('nod_start_failed', (error) => {
+          channel.available = false;
+          channel.error = failure(error).message;
+          replacementNeeded = true;
+        });
         connection.on('error', (error) => {
           channel.available = false;
           channel.error = failure(error).message;
@@ -428,7 +514,8 @@ export function createSlackTransport(
           if (
             dm !== verified.dmId ||
             (event.type === 'message' &&
-              (event.channel_type !== 'im' || (event.subtype && event.subtype !== 'file_share'))) ||
+              (event.channel_type !== 'im' ||
+                (event.subtype && !['file_share', 'thread_broadcast'].includes(event.subtype)))) ||
             !['message', 'reaction_added', 'reaction_removed'].includes(event.type)
           ) {
             void ack().catch(() => {});
@@ -442,7 +529,11 @@ export function createSlackTransport(
         channel.available = false;
         channel.error = failure(error).message;
         await connection?.disconnect().catch(() => {});
+        connection?.removeAllListeners();
         connection = undefined;
+        replacementNeeded = false;
+        nextAttempt = Date.now() + Math.min(30_000, 2000 * 2 ** (attempts - 1));
+        if (attempts >= 5) channel.error += ' Reconnect in Channels.';
         throw failure(error);
       }
     })().finally(() => {
@@ -454,7 +545,6 @@ export function createSlackTransport(
   function target(input: { accountId: string; threadId: string }) {
     if (
       closed ||
-      !channel.available ||
       !verified ||
       input.accountId !== channel.accountId ||
       input.threadId !== verified.dmId
@@ -515,7 +605,7 @@ export function createSlackTransport(
             ...(event.thread_ts && event.thread_ts !== event.ts
               ? { replyToMessageId: `${verified!.dmId}:${event.thread_ts}` }
               : {}),
-            ...(event.files?.length ? { attachments: event.files.map(attachment) } : {}),
+            ...(event.files?.length ? { attachments: event.files.map(incomingAttachment) } : {}),
           } satisfies InboundMessage);
         } else if (react && event.item?.type === 'message' && event.reaction && event.event_ts) {
           const emoji = reactionEmoji(event.reaction);
@@ -550,7 +640,7 @@ export function createSlackTransport(
               } satisfies InboundReaction);
           }
         }
-        await item.ack();
+        await item.ack().catch(() => {});
         incoming.delete(key);
       }
     },
@@ -561,94 +651,106 @@ export function createSlackTransport(
       const dm = target(input);
       if (input.replyToMessageId) messageId(input.replyToMessageId);
       const ids: string[] = [];
-      const text = slackText(
-        input.text || input.attachments?.map((file) => file.name).join('\n') || '',
-      );
-      for (let offset = 0; offset < text.length;) {
-        let end = Math.min(offset + 3000, text.length);
-        if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
-        const result = await operation(() =>
-          web!.chat.postMessage({
-            channel: dm,
-            text: text.slice(offset, end),
-            unfurl_links: false,
-            unfurl_media: false,
-            parse: 'none',
-            link_names: false,
-          }),
+      try {
+        const parts = slackMessages(
+          input.text || input.attachments?.map((file) => file.name).join('\n') || '',
         );
-        if (!result.ts || !timestamp.test(result.ts))
-          throw new MessagingConnectionError('Slack failed: message_receipt_unavailable.');
-        ids.push(`${dm}:${result.ts}`);
-        offset = end;
-      }
-      const unsent: string[] = [];
-      for (const file of input.attachments ?? []) {
-        let bytes: Uint8Array;
-        try {
-          if (!file.size || file.size > fileLimit) throw new MessagingAttachmentError(fileLimit);
-          bytes = await file.read(lifetime.signal);
-          if (bytes.length !== file.size || bytes.length > fileLimit)
-            throw new MessagingAttachmentError(fileLimit);
-        } catch {
-          unsent.push(file.name);
-          continue;
+        for (const text of parts) {
+          const result = await operation(() =>
+            web!.chat.postMessage({
+              channel: dm,
+              text,
+              unfurl_links: false,
+              unfurl_media: false,
+              parse: 'none',
+              link_names: false,
+            }),
+          );
+          if (!result.ts || !timestamp.test(result.ts))
+            throw new MessagingConnectionError('Slack failed: message_receipt_unavailable.');
+          ids.push(`${dm}:${result.ts}`);
         }
-        const upload = await operation(() =>
-          web!.files.getUploadURLExternal({ filename: file.name, length: bytes.length }),
-        );
-        if (!upload.file_id)
-          throw new MessagingConnectionError('Slack failed: upload_receipt_unavailable.');
-        const response = await operation(() =>
-          fetch(fileUrl(upload.upload_url, true), {
-            method: 'POST',
-            body: Buffer.from(bytes),
-            redirect: 'error',
-            signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(60_000)]),
-          }),
-        );
-        if (!response.ok)
-          throw new MessagingConnectionError(`Slack file upload failed: HTTP ${response.status}.`);
-        await operation(() =>
-          web!.files.completeUploadExternal({
-            files: [{ id: upload.file_id!, title: file.name }],
-            channel_id: dm,
-          }),
-        );
-        const shared = await operation(() => web!.files.info({ file: upload.file_id! }));
-        const shares = z
-          .object({
-            shares: z
+        const unsent: string[] = [];
+        let uncertain: MessagingConnectionError | undefined;
+        for (const file of input.attachments ?? []) {
+          let bytes: Uint8Array;
+          try {
+            if (!file.size || file.size > fileLimit) throw new MessagingAttachmentError(fileLimit);
+            bytes = await file.read(lifetime.signal);
+            if (bytes.length !== file.size || bytes.length > fileLimit)
+              throw new MessagingAttachmentError(fileLimit);
+          } catch {
+            unsent.push(file.name);
+            continue;
+          }
+          try {
+            const upload = await operation(() =>
+              web!.files.getUploadURLExternal({ filename: file.name, length: bytes.length }),
+            );
+            if (!upload.file_id)
+              throw new MessagingConnectionError('Slack failed: upload_receipt_unavailable.');
+            const response = await operation(() =>
+              fetch(fileUrl(upload.upload_url, true), {
+                method: 'POST',
+                body: Buffer.from(bytes),
+                redirect: 'error',
+                signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(60_000)]),
+              }),
+            );
+            if (!response.ok)
+              throw new MessagingConnectionError(
+                `Slack file upload failed: HTTP ${response.status}.`,
+              );
+            await operation(() =>
+              web!.files.completeUploadExternal({
+                files: [{ id: upload.file_id!, title: file.name }],
+                channel_id: dm,
+              }),
+            );
+            const shared = await operation(() => web!.files.info({ file: upload.file_id! }));
+            const shares = z
               .object({
-                private: z
-                  .record(z.string(), z.array(z.object({ ts: z.string().regex(timestamp) })))
+                shares: z
+                  .object({
+                    private: z
+                      .record(z.string(), z.array(z.object({ ts: z.string().regex(timestamp) })))
+                      .optional(),
+                  })
                   .optional(),
               })
-              .optional(),
-          })
-          .safeParse(shared.file);
-        const receipts = shares.success ? (shares.data.shares?.private?.[dm] ?? []) : [];
-        if (!receipts.length)
-          throw new MessagingConnectionError('Slack failed: file_message_receipt_unavailable.');
-        for (const share of receipts) ids.push(`${dm}:${share.ts}`);
+              .safeParse(shared.file);
+            const receipts = shares.success ? (shares.data.shares?.private?.[dm] ?? []) : [];
+            if (!receipts.length)
+              throw new MessagingConnectionError('Slack failed: file_message_receipt_unavailable.');
+            for (const share of receipts) ids.push(`${dm}:${share.ts}`);
+          } catch (error) {
+            uncertain ??= failure(error);
+            if (closed) throw uncertain;
+          }
+        }
+        if (unsent.length) {
+          const notice = await input.attachmentFailure?.(unsent);
+          if (!notice) throw new MessagingConnectionError('Slack failed: attachment_unavailable.');
+          for (const text of slackMessages(notice)) {
+            const sent = await operation(() =>
+              web!.chat.postMessage({
+                channel: dm,
+                text,
+                unfurl_links: false,
+                unfurl_media: false,
+                parse: 'none',
+              }),
+            );
+            if (!sent.ts || !timestamp.test(sent.ts))
+              throw new MessagingConnectionError('Slack failed: message_receipt_unavailable.');
+            ids.push(`${dm}:${sent.ts}`);
+          }
+        }
+        if (uncertain) throw uncertain;
+        return { id: ids[0] ?? '', ids };
+      } catch (error) {
+        throw new MessagingDeliveryError(failure(error).message, ids);
       }
-      if (unsent.length) {
-        const notice = await input.attachmentFailure?.(unsent);
-        if (!notice) throw new MessagingConnectionError('Slack failed: attachment_unavailable.');
-        const sent = await operation(() =>
-          web!.chat.postMessage({
-            channel: dm,
-            text: slackText(notice),
-            unfurl_links: false,
-            unfurl_media: false,
-            parse: 'none',
-          }),
-        );
-        if (!sent.ts)
-          throw new MessagingConnectionError('Slack failed: message_receipt_unavailable.');
-        ids.push(`${dm}:${sent.ts}`);
-      }
-      return { id: ids[0] ?? '', ids };
     },
     async react(input) {
       const dm = target(input);
@@ -676,6 +778,11 @@ export function createSlackTransport(
               : reactionWeb.reactions.add({ channel: dm, timestamp: ts, name }),
           );
         } catch (error) {
+          if (
+            error instanceof MessagingConnectionError &&
+            error.message === 'Slack failed: invalid_name.'
+          )
+            return 'unsupported' as const;
           if (!(
             error instanceof MessagingConnectionError &&
             (remove
@@ -685,8 +792,12 @@ export function createSlackTransport(
             throw error;
         }
       };
-      for (const name of previous) if (name !== desired) await change(name, true);
-      if (desired && !previous.includes(desired)) await change(desired, false);
+      for (const name of previous) {
+        if (name !== desired && (await change(name, true)) === 'unsupported') return 'unsupported';
+      }
+      if (desired && !previous.includes(desired)) {
+        if ((await change(desired, false)) === 'unsupported') return 'unsupported';
+      }
       return 'sent';
     },
     async close() {
