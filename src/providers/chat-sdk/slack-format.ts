@@ -3,7 +3,14 @@ import type { KnownBlock, RichTextText, RichTextLink } from '@slack/types';
 
 type Node = Root | Root['children'][number];
 type Style = { bold?: boolean; italic?: boolean; strike?: boolean; code?: boolean };
-type Span = { text: string; style?: Style; url?: string; from?: number; end: number };
+type Span = {
+  text: string;
+  style?: Style;
+  url?: string;
+  from?: number;
+  end: number;
+  raw?: boolean;
+};
 type Frame = {
   type: 'section' | 'quote' | 'code' | 'list';
   indent?: number;
@@ -55,21 +62,8 @@ function literal(source: string): SlackPart[] {
   return parts;
 }
 
-function witnessed(root: Root, source: string) {
-  const parents = new Set([
-    'root',
-    'paragraph',
-    'heading',
-    'strong',
-    'emphasis',
-    'delete',
-    'blockquote',
-    'list',
-    'listItem',
-    'table',
-    'tableRow',
-    'tableCell',
-  ]);
+function exact(node: Node, source: string) {
+  const parents = new Set(['paragraph', 'heading', 'tableCell', 'strong', 'emphasis', 'delete']);
   let count = 0;
   const walk = (node: Node, from: number, to: number, depth: number): boolean => {
     if (++count > 20_000 || depth > 64) return false;
@@ -91,17 +85,6 @@ function witnessed(root: Root, source: string) {
       const match = /^(`+)([^\n]*?)\1$/.exec(raw);
       return Boolean(match && match[2] === node.value);
     }
-    if (node.type === 'code') {
-      const match = /^(`{3,}|~{3,})([\w#+.-]*)\n([\s\S]*?)\n\1$/.exec(raw);
-      return Boolean(
-        match &&
-        node.value &&
-        match[3] === node.value &&
-        (node.lang ?? '').length <= 80 &&
-        (node.lang ?? '') === match[2] &&
-        !node.meta,
-      );
-    }
     if (node.type === 'link') {
       if (
         !/^(https?|mailto|tel):/i.test(node.url) ||
@@ -112,31 +95,8 @@ function witnessed(root: Root, source: string) {
         !raw.endsWith(`](${node.url})`)
       )
         return false;
-    } else if (node.type === 'list' && node.ordered) {
-      if ((node.start ?? 1) < 1) return false;
-      if (
-        !node.children.every(
-          (item, index) =>
-            /^(\d+)[.)] /.exec(source.slice(start(item), end(item)))?.[1] ===
-            String((node.start ?? 1) + index),
-        )
-      )
-        return false;
     } else if (node.type === 'break') return /^ {2,}\n$/.test(raw);
-    else if (node.type === 'thematicBreak') return /^\s*([-*_])(?:\s*\1){2,}\s*$/.test(raw);
     else if (!parents.has(node.type)) return false;
-    if (node.type === 'heading' && !node.children.length) return false;
-    if (
-      node.type === 'blockquote' &&
-      (node.children.length !== 1 || node.children[0].type !== 'paragraph')
-    )
-      return false;
-    if (
-      node.type === 'listItem' &&
-      (node.children[0]?.type !== 'paragraph' ||
-        node.children.slice(1).some((child) => child.type !== 'list'))
-    )
-      return false;
     let previous = a;
     for (const child of children(node)) {
       if ((child.position?.start.offset ?? -1) < previous || !walk(child, a, b, depth + 1))
@@ -145,10 +105,13 @@ function witnessed(root: Root, source: string) {
     }
     return true;
   };
+  const a = node.position?.start.offset;
+  const b = node.position?.end.offset;
   return (
-    root.position?.start.offset === 0 &&
-    root.position.end.offset === source.length &&
-    walk(root, 0, source.length, 0)
+    a !== undefined &&
+    b !== undefined &&
+    !/[&\\<%\t]/u.test(source.slice(a, b)) &&
+    walk(node, a, b, 0)
   );
 }
 
@@ -188,13 +151,28 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
     const parts = literal(source);
     return { units: [], parts, plain: parts };
   };
-  if (!source || metadata || source.length > 100_000 || /[&\\<%\r\t\uFEFF]/u.test(source))
+  if (!source || metadata || source.length > 100_000 || /[\r\uFEFF]|<[!@#]/u.test(source))
     return fallback();
   try {
     const root = parseMarkdown(source);
-    if (!witnessed(root, source)) return fallback();
+    if (root.position?.start.offset !== 0 || root.position.end.offset !== source.length)
+      return fallback();
     const units: SlackUnit[] = [];
     let covered = 0;
+    const framed = (node: Node, from: number, to: number) => {
+      const a = node.position?.start.offset;
+      const b = node.position?.end.offset;
+      if (
+        a === undefined ||
+        b === undefined ||
+        !Number.isInteger(a) ||
+        !Number.isInteger(b) ||
+        a < from ||
+        b > to ||
+        a > b
+      )
+        throw new Error('native_shape');
+    };
     const inline = (node: Node, style: Style = {}): Span[] => {
       if (node.type === 'text')
         return [{ text: node.value, style, from: start(node), end: end(node) }];
@@ -238,6 +216,18 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           },
         ];
       return children(node).flatMap((n) => inline(n, style));
+    };
+    const leaf = (node: Node, style: Style = {}): Span[] => {
+      if (exact(node, source)) return inline(node, style);
+      const parts = children(node);
+      const positioned = parts.every(
+        (child) =>
+          Number.isInteger(child.position?.start.offset) &&
+          Number.isInteger(child.position?.end.offset),
+      );
+      const from = positioned && parts.length ? start(parts[0]) : start(node);
+      const to = positioned && parts.length ? end(parts[parts.length - 1]) : end(node);
+      return [{ text: source.slice(from, to), style, from, end: to, raw: true }];
     };
     const emit = (
       spans: Span[],
@@ -345,13 +335,15 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
       covered = units[units.length - 1].end;
     };
     const block = (node: Node, indent = 0, separator = '\n\n') => {
+      if (['blockquote', 'list', 'table'].includes(node.type))
+        for (const child of children(node)) framed(child, start(node), end(node));
       if (node.type === 'heading') {
-        const spans = inline(node);
+        const spans = leaf(node);
         const value = spans.map((s) => s.text).join('');
         if (
           value &&
           value.length <= 150 &&
-          spans.every((s) => !s.url && !Object.values(s.style ?? {}).some(Boolean))
+          spans.every((s) => !s.url && !s.raw && !Object.values(s.style ?? {}).some(Boolean))
         ) {
           units.push({
             block: { type: 'header', text: { type: 'plain_text', text: value, emoji: false } },
@@ -362,14 +354,26 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           covered = end(node);
         } else
           emit(
-            inline(node, { bold: true }),
+            leaf(node, { bold: true }),
             { type: 'section' },
             end(node),
             units.length ? separator : '',
           );
       } else if (node.type === 'paragraph')
-        emit(inline(node), { type: 'section' }, end(node), units.length ? separator : '');
+        emit(leaf(node), { type: 'section' }, end(node), units.length ? separator : '');
       else if (node.type === 'code') {
+        const raw = source.slice(start(node), end(node));
+        const match = /^(`{3,}|~{3,})([\w#+.-]*)\n([\s\S]*?)\n\1$/.exec(raw);
+        if (
+          !match ||
+          !node.value ||
+          match[3] !== node.value ||
+          (node.lang ?? '').length > 80 ||
+          (node.lang ?? '') !== match[2] ||
+          node.meta ||
+          /[&\\<%\t]/u.test(raw)
+        )
+          throw new Error('native_shape');
         const bodyFrom = source.indexOf('\n', start(node)) + 1;
         emit(
           [{ text: node.value, from: bodyFrom, end: bodyFrom + node.value.length }],
@@ -377,15 +381,33 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           end(node),
           units.length ? separator : '',
         );
-      } else if (node.type === 'blockquote')
-        emit(inline(node), { type: 'quote' }, end(node), units.length ? separator : '');
-      else if (node.type === 'list') {
+      } else if (node.type === 'blockquote') {
+        if (node.children.length !== 1 || node.children[0].type !== 'paragraph')
+          throw new Error('native_shape');
+        emit(leaf(node.children[0]), { type: 'quote' }, end(node), units.length ? separator : '');
+      } else if (node.type === 'list') {
         if (indent > 8) throw new Error('native_indent');
+        if (
+          node.ordered &&
+          ((node.start ?? 1) < 1 ||
+            !node.children.every(
+              (item, index) =>
+                /^(\d+)[.)] /.exec(source.slice(start(item), end(item)))?.[1] ===
+                String((node.start ?? 1) + index),
+            ))
+        )
+          throw new Error('native_shape');
         for (const [index, item] of node.children.entries()) {
+          if (
+            item.children[0]?.type !== 'paragraph' ||
+            item.children.slice(1).some((child) => child.type !== 'list')
+          )
+            throw new Error('native_shape');
+          for (const child of item.children) framed(child, start(item), end(item));
           const number = node.ordered ? (node.start ?? 1) + index : undefined;
           for (const child of item.children) {
             if (child.type === 'paragraph') {
-              const spans = inline(child);
+              const spans = leaf(child);
               if (item.checked !== null && item.checked !== undefined)
                 spans.unshift({ text: item.checked ? '[x] ' : '[ ] ', end: start(child) });
               emit(spans, { type: 'list', indent, number }, end(child), units.length ? '\n' : '');
@@ -395,9 +417,11 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           covered = end(item);
         }
       } else if (node.type === 'table') {
+        for (const row of node.children)
+          for (const cell of row.children) framed(cell, start(row), end(row));
         const [head, ...rows] = node.children;
         const labels = head.children.map((cell) =>
-          inline(cell)
+          leaf(cell)
             .map((s) => s.text)
             .join(''),
         );
@@ -405,7 +429,7 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           emit(
             head.children.flatMap((cell, index) => [
               ...(index ? [{ text: '\n', end: start(cell) }] : []),
-              ...inline(cell),
+              ...leaf(cell),
             ]),
             { type: 'section' },
             end(head),
@@ -420,11 +444,14 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
               end: start(row),
             });
             if (row.children[index])
-              spans.push(...inline(row.children[index], index ? {} : { bold: true }));
+              spans.push(...leaf(row.children[index], index ? {} : { bold: true }));
           }
           emit(spans, { type: 'section' }, end(row), units.length ? '\n\n' : '', true);
         }
-      } else if (node.type === 'thematicBreak')
+      } else if (
+        node.type === 'thematicBreak' &&
+        /^\s*([-*_])(?:\s*\1){2,}\s*$/.test(source.slice(start(node), end(node)))
+      )
         emit(
           [{ text: '---', end: end(node) }],
           { type: 'section' },
@@ -433,7 +460,23 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
         );
       else throw new Error('native_shape');
     };
-    for (const node of root.children) block(node);
+    for (const node of root.children) {
+      framed(node, covered, source.length);
+      const count = units.length;
+      const from = covered;
+      try {
+        block(node);
+      } catch {
+        units.length = count;
+        covered = from;
+        emit(
+          [{ text: source.slice(start(node), end(node)), from: start(node), end: end(node) }],
+          { type: 'section' },
+          end(node),
+          units.length ? '\n\n' : '',
+        );
+      }
+    }
     if (!units.length) return fallback();
     units[units.length - 1].end = source.length;
     const parts = pack(units, true);
