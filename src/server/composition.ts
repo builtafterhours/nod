@@ -3040,6 +3040,7 @@ async function initializeApplication(
         attachments,
         onInserted,
         stopSignal,
+        replyContext,
       ) =>
         (
           await userMessages.submit(text, attachments, {
@@ -3051,6 +3052,7 @@ async function initializeApplication(
             answer,
             onInserted,
             stopSignal,
+            replyContext,
           })
         ).turnId,
       stopSignal,

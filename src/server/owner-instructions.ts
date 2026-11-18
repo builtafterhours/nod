@@ -180,11 +180,12 @@ export async function captureOwnerInstructions(
       text: string;
       created_at: Date;
       reply_to_message_id: string | null;
+      no_reply_context: boolean;
       reaction: boolean;
       confirmation: string | null;
       approval_status: string | null;
     }>(
-      `WITH own AS (SELECT m.id,m.text,m.created_at,m.reply_to_message_id,
+      `WITH own AS (SELECT m.id,m.text,m.created_at,m.reply_to_message_id,m.no_reply_context,
              EXISTS (SELECT 1 FROM turns r WHERE r.owner_id=$1 AND r.message_id=m.id
                AND r.source_id LIKE 'reaction-reply:%') AS reaction
            FROM turns u JOIN messages m ON m.owner_id=u.owner_id AND m.thread_id=u.thread_id
@@ -249,20 +250,24 @@ export async function captureOwnerInstructions(
       : users.find((row) => row.can_authorize);
   if (!latest) return undefined;
   const confirmationReply =
-    current && current.approval_status !== null && current.confirmation !== null
+    current &&
+    !current.no_reply_context &&
+    current.approval_status !== null &&
+    current.confirmation !== null
       ? {
           reply: current.text,
           confirmation: current.confirmation,
           status: current.approval_status,
         }
       : undefined;
-  const before = (
-    taskId
-      ? await pool.query<{ id: string; text: string }>(
-          `WITH latest AS (SELECT m.id,m.created_at,m.reply_to_message_id,u.channel FROM messages m
+  const before = current?.no_reply_context
+    ? undefined
+    : (taskId
+        ? await pool.query<{ id: string; text: string }>(
+            `WITH latest AS (SELECT m.id,m.created_at,m.reply_to_message_id,m.no_reply_context,u.channel FROM messages m
                JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id WHERE m.id=$3 AND m.owner_id=$1),
              answered AS (SELECT a.id,a.owner_id,a.text,a.turn_id FROM messages a, latest
-               WHERE a.owner_id=$1 AND a.thread_id=$2 AND a.role='assistant' AND a.text<>'' AND a.hidden_at IS NULL
+               WHERE a.owner_id=$1 AND a.thread_id=$2 AND a.role='assistant' AND a.text<>'' AND a.hidden_at IS NULL AND NOT latest.no_reply_context
                  AND a.created_at>$5 AND (a.created_at,a.id)<(latest.created_at,latest.id)
                  AND (a.id=latest.reply_to_message_id OR (latest.reply_to_message_id IS NULL
                    AND EXISTS (SELECT 1 FROM turns c WHERE c.id=a.turn_id AND c.owner_id=$1 AND c.channel=latest.channel)))
@@ -271,14 +276,14 @@ export async function captureOwnerInstructions(
                OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=$4::uuid AND t.owner_id=$1 AND t.message_id=answered.id))
                AND NOT ${withdrawnSql('answered')}
                AND NOT EXISTS (SELECT 1 FROM approvals p WHERE p.owner_id=$1 AND p.confirmation_message_id=answered.id)`,
-          [ownerId, threadId, latest.id, taskId, since],
-        )
-      : await pool.query<{ id: string; text: string }>(
-          `WITH latest AS (SELECT m.id,m.created_at,m.reply_to_message_id,u.channel FROM messages m
+            [ownerId, threadId, latest.id, taskId, since],
+          )
+        : await pool.query<{ id: string; text: string }>(
+            `WITH latest AS (SELECT m.id,m.created_at,m.reply_to_message_id,m.no_reply_context,u.channel FROM messages m
                JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id
                WHERE m.id=$3 AND m.owner_id=$1 AND m.thread_id=$2),
              answered AS (SELECT m.id,m.owner_id,m.turn_id,m.text FROM messages m CROSS JOIN latest
-               WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.role='assistant' AND m.text<>'' AND m.hidden_at IS NULL
+               WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.role='assistant' AND m.text<>'' AND m.hidden_at IS NULL AND NOT latest.no_reply_context
                  AND m.created_at>$4 AND (m.created_at,m.id)<(latest.created_at,latest.id)
                  AND (m.id=latest.reply_to_message_id OR (latest.reply_to_message_id IS NULL
                    AND EXISTS (SELECT 1 FROM turns c WHERE c.id=m.turn_id AND c.owner_id=$1 AND c.channel=latest.channel)))
@@ -286,9 +291,9 @@ export async function captureOwnerInstructions(
                ORDER BY m.created_at DESC,m.id DESC LIMIT 1)
              SELECT id,text FROM answered WHERE NOT ${withdrawnSql('answered')}
                AND NOT EXISTS (SELECT 1 FROM approvals p WHERE p.owner_id=$1 AND p.confirmation_message_id=answered.id)`,
-          [ownerId, threadId, latest.id, since],
-        )
-  ).rows[0];
+            [ownerId, threadId, latest.id, since],
+          )
+      ).rows[0];
   const ordered = users.reverse();
   return {
     evidence: {
