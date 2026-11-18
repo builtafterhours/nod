@@ -351,7 +351,7 @@ async function slackTopLevelUnanswered(
            AND i.provider='slack' AND i.provider_reply_id IS NULL
          JOIN channel_main_work w ON w.owner_id=i.owner_id AND w.turn_id=i.turn_id
          WHERE m.owner_id=$1 AND m.id=$2 AND m.reply_to_message_id IS NULL AND NOT EXISTS (
-           SELECT 1 FROM channel_outbox o WHERE o.message_id=$3
+           SELECT 1 FROM channel_outbox o WHERE o.message_id=$3 AND o.state='sent' AND NOT o.delivery_only
              AND o.dispatched_installation_id IS NOT NULL AND o.dispatched_root_id IS NULL)`,
         [ownerId, messageId, answeredId],
       )
