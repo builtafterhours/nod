@@ -2613,7 +2613,7 @@ test('secret redaction keeps valid tokens when another token is missing', () => 
 
 test('Slack app and bot tokens stay out of text, objects and environment-derived secrets', () => {
   const bot = 'xoxb-1234567890-synthetic-bot-value';
-  const app = 'xapp-1-A0SYNTHETIC-1234567890-synthetic';
+  const app = 'xapp-synthetic-app-level-value';
   assert.equal(
     redactSecretText(`Slack failed for ${bot} and ${app}.`),
     'Slack failed for [redacted] and [redacted].',
