@@ -57,7 +57,7 @@ A model-written task list in the workspace does not replace the ledger. The exis
 
 ### Plan intent and progress
 
-A task can store a structured plan of up to 50 step titles, each at most 200 characters, where most emoji count as two. Longer input is rejected, not truncated. Each step starts **pending**, and the task marks a step **started** when it begins that work. These record intent, not outcomes: there are no completed or failed steps, and finishing, waiting or failing a task completes none of them. Older plans saved as plain text stay readable, with their step state shown as unknown.
+A task can store a structured plan of up to 50 step titles, each at most 200 characters, where some characters, such as many emoji, count as two or more. Longer input is rejected, not truncated. Each step starts **pending**, and the task marks a step **started** when it begins that work. These record intent, not outcomes: there are no completed or failed steps, and finishing, waiting or failing a task completes none of them. Older plans saved as plain text stay readable, with their step state shown as unknown.
 
 Plan changes use the normal turn lock and Stop. Each write must name the plan's current revisions and come from the task's current turn and owner instruction, so a stale, conflicting or repeated write fails and is not retried. Replacing a changed plan gives every step a new ID and resets it to pending. For new multi-step tasks, the task tool asks Pi to save a structured plan and mark each step started explicitly; tool activity alone never marks a step started.
 
