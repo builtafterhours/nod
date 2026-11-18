@@ -69,6 +69,7 @@ interface ChannelOptions {
       threadId?: string;
       replyToMessageId?: string;
       receiptOnly?: boolean;
+      validateReplyTarget?: (client: PoolClient) => Promise<void>;
       persistOrdinary: (client: PoolClient) => Promise<void>;
       persistVerification?: (client: PoolClient, response: SubmitMessageResponse) => Promise<void>;
     },
@@ -398,8 +399,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS live_status text;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS streamed boolean NOT NULL DEFAULT false;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS delivery_only boolean NOT NULL DEFAULT false;
+  ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS answer_conversation_id uuid;
+  ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS dispatched_root_id text;
+  ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS dispatched_installation_id text;
   CREATE INDEX IF NOT EXISTS channel_inbox_pending ON channel_inbox(state,created_at);
   CREATE INDEX IF NOT EXISTS channel_outbox_pending ON channel_outbox(state,created_at);
+  CREATE INDEX IF NOT EXISTS channel_outbox_provider_ids ON channel_outbox USING gin(provider_message_ids) WITH (fastupdate=off);
   CREATE INDEX IF NOT EXISTS channel_inbox_turn ON channel_inbox(turn_id);
   CREATE INDEX IF NOT EXISTS channel_inbox_channel ON channel_inbox(owner_id,channel,state,received_at DESC)`);
   await pool.query(
@@ -613,7 +618,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         `SELECT o.message_id FROM channel_outbox o JOIN channel_inbox i ON i.source_id=o.source_id
          JOIN messages m ON m.id=o.message_id AND m.owner_id=i.owner_id
          WHERE i.owner_id=$1 AND i.provider=$2 AND i.account_id=$3 AND i.sender_id=$4
-           AND i.thread_id=$5 AND $6=ANY(o.provider_message_ids) AND o.state IN ('sent','uncertain') ${slackQuestionFence}
+           AND i.thread_id=$5 AND o.provider_message_ids @> ARRAY[$6]::text[] AND o.state IN ('sent','uncertain') ${slackQuestionFence}
          UNION ALL
          SELECT message_id FROM channel_inbox WHERE owner_id=$1 AND provider=$2 AND account_id=$3
            AND sender_id=$4 AND thread_id=$5 AND source_id=$7 AND state='submitted'
@@ -633,23 +638,24 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     return mainTarget;
   }
 
-  async function routingOnlyReply(
-    identity: ChannelIdentity,
+  async function answerContext(
+    identity: ChannelIdentity & {
+      installation_id?: string | null;
+      canonical_root_id?: string | null;
+    },
     dm: string,
     root: string | null | undefined,
-    target: string | undefined,
+    purpose: 'ordinary' | 'verification',
+    exactMessageId?: string,
+    database: Pool | PoolClient = pool,
   ) {
-    if (identity.provider !== 'slack' || !root || !target) return false;
-    if (!(await rich.resolveMain(identity, dm, root)).target) return false;
-    return Boolean(
-      (
-        await pool.query(
-          `SELECT 1 FROM messages m JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id
-           WHERE m.id=$1 AND m.owner_id=$2 AND m.role='user' AND u.session_id=u.thread_id`,
-          [target, ownerId],
-        )
-      ).rowCount,
-    );
+    if (identity.provider !== 'slack' || !root) return { kind: 'legacy' } as const;
+    const task = await rich.resolve(identity, dm, root);
+    if (task.known) return { kind: 'legacy' } as const;
+    const main = await rich.resolveMain(identity, dm, root);
+    if (!main.known && (!identity.installation_id || !identity.canonical_root_id))
+      return { kind: 'legacy' } as const;
+    return rich.resolveAnswer(database, identity, dm, root, purpose, exactMessageId);
   }
 
   async function hiddenReplyTarget(database: Pool | PoolClient, messageId: string) {
@@ -701,10 +707,10 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     try {
       const sourceId = `channel:${channelId}:${accountId}:${messageId}`;
       const recorded = (
-        await pool.query('SELECT state FROM channel_inbox WHERE source_id=$1 AND owner_id=$2', [
-          sourceId,
-          ownerId,
-        ])
+        await pool.query(
+          'SELECT state,message_id FROM channel_inbox WHERE source_id=$1 AND owner_id=$2',
+          [sourceId, ownerId],
+        )
       ).rows[0];
       const hasMedia = Boolean(parsed.data.attachments?.length);
       const modelMissingAtIntake = hasMedia && options.modelConfigured?.() === false;
@@ -883,19 +889,72 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       }
       if (verificationReply && options.acceptVerification) {
         try {
-          const target = replyToMessageId
-            ? await nativeReply(identity, threadId, replyToMessageId, true)
-            : undefined;
-          const routingOnly = await routingOnlyReply(identity, threadId, replyToMessageId, target);
-          if (replyToMessageId && !target)
+          const target = recorded
+            ? ((
+                await pool.query(
+                  'SELECT reply_to_message_id FROM messages WHERE id=$1 AND owner_id=$2',
+                  [recorded.message_id, ownerId],
+                )
+              ).rows[0]?.reply_to_message_id ?? undefined)
+            : replyToMessageId
+              ? await nativeReply(identity, threadId, replyToMessageId, true)
+              : undefined;
+          const scope = recorded
+            ? ({ kind: 'legacy' } as const)
+            : await answerContext(
+                {
+                  ...identity,
+                  installation_id: installationId,
+                  canonical_root_id: conversationRootMessageId,
+                },
+                threadId,
+                replyToMessageId,
+                'verification',
+                target,
+              );
+          if (scope.kind === 'refused')
             throw Object.assign(new Error('The verification reply is unavailable.'), {
               statusCode: 409,
             });
+          if (!recorded && replyToMessageId && !target)
+            if (scope.kind !== 'main')
+              throw Object.assign(new Error('The verification reply is unavailable.'), {
+                statusCode: 409,
+              });
+          const contextMessageId = scope.kind === 'main' ? scope.messageId : target;
           verification = await options.acceptVerification(text, {
             clientMessageId: acceptedMessageId,
             channel: conversationChannel(identity),
             ...(mediaThreadId ? { threadId: mediaThreadId } : {}),
-            ...(target && !routingOnly ? { replyToMessageId: target } : {}),
+            ...(contextMessageId ? { replyToMessageId: contextMessageId } : {}),
+            ...(scope.kind === 'main'
+              ? {
+                  validateReplyTarget: async (client: PoolClient) => {
+                    const current = await answerContext(
+                      {
+                        ...identity,
+                        installation_id: installationId,
+                        canonical_root_id: conversationRootMessageId,
+                      },
+                      threadId,
+                      replyToMessageId,
+                      'verification',
+                      target,
+                      client,
+                    );
+                    if (
+                      current.kind !== 'main' ||
+                      current.conversationId !== scope.conversationId ||
+                      current.turnId !== scope.turnId ||
+                      current.messageId !== scope.messageId ||
+                      current.requestId !== scope.requestId
+                    )
+                      throw Object.assign(new Error('The verification reply is unavailable.'), {
+                        statusCode: 409,
+                      });
+                  },
+                }
+              : {}),
             ...(recorded ? { receiptOnly: true } : {}),
             persistOrdinary: async (client) => {
               if (
@@ -1076,7 +1135,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const resolvedReply = pending.provider_reply_id
       ? await nativeReply(pending, pending.thread_id, pending.provider_reply_id)
       : undefined;
-    const exactReply = pending.provider_reply_id
+    const providerExactQ = pending.provider_reply_id
       ? await nativeReply(pending, pending.thread_id, pending.provider_reply_id, true)
       : undefined;
     const routedReplyToMessageId =
@@ -1088,14 +1147,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             )
           ).rows[0]?.id
         : resolvedReply;
-    const replyToMessageId = (await routingOnlyReply(
+    let scope = await answerContext(
       pending,
       pending.thread_id,
       pending.provider_reply_id,
-      routedReplyToMessageId,
-    ))
-      ? undefined
-      : routedReplyToMessageId;
+      'ordinary',
+      providerExactQ,
+    );
+    let replyToMessageId = scope.kind === 'main' ? scope.messageId : routedReplyToMessageId;
     const hiddenBeforeAnswer = routedReplyToMessageId
       ? await hiddenReplyTarget(pool, routedReplyToMessageId)
       : undefined;
@@ -1119,8 +1178,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       hiddenBeforeAnswer ||
       command ||
       pending.attachments?.length ||
-      (pending.provider === 'slack' && !replyToMessageId) ||
-      (pending.provider === 'slack' && exactReply !== replyToMessageId) ||
+      (pending.provider === 'slack' && !providerExactQ) ||
       (pending.provider === 'slack' &&
         !(
           hasApprovals &&
@@ -1129,13 +1187,19 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               `SELECT 1 FROM approvals a JOIN channel_outbox o ON o.message_id=a.confirmation_message_id
          JOIN channel_inbox i ON i.source_id=o.source_id WHERE a.owner_id=$1 AND a.confirmation_message_id=$2 AND a.status='pending'
          AND o.state='sent' AND NOT o.streamed AND NOT o.delivery_only AND i.owner_id=$1 AND i.provider='slack' AND i.account_id=$3 AND i.sender_id=$4`,
-              [ownerId, replyToMessageId, pending.account_id, pending.sender_id],
+              [ownerId, providerExactQ, pending.account_id, pending.sender_id],
             )
           ).rowCount
         )) ||
       (pending.provider_reply_id && !replyToMessageId)
         ? undefined
-        : await options.answer?.(pending.text, channel, replyToMessageId).catch(() => undefined);
+        : await options
+            .answer?.(
+              pending.text,
+              channel,
+              pending.provider === 'slack' ? providerExactQ : replyToMessageId,
+            )
+            .catch(() => undefined);
     let afterCommit: (() => Promise<void>) | undefined;
     const replyTargetChanged = Symbol('reply target changed');
     const submitted = await transaction(async (client) => {
@@ -1145,11 +1209,26 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       );
       const row = result.rows[0];
       if (!row) return;
+      await options.activeThread?.(client);
+      scope = await answerContext(
+        row,
+        row.thread_id,
+        row.provider_reply_id,
+        'ordinary',
+        providerExactQ,
+        client,
+      );
+      replyToMessageId =
+        answer && row.provider === 'slack'
+          ? providerExactQ
+          : scope.kind === 'main'
+            ? scope.messageId
+            : routedReplyToMessageId;
       if (
         permitted(row) &&
         row.provider === 'slack' &&
         row.provider_reply_id &&
-        !routedReplyToMessageId
+        (!routedReplyToMessageId || (scope.kind === 'refused' && !answer))
       ) {
         const threadId = options.activeThread ? (await options.activeThread(client)).id : null;
         await saveReply(client, row.source_id, threadId, {
@@ -1559,11 +1638,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           };
           postStarted = true;
           return (async () => {
-            if (
-              row.provider !== 'slack' ||
-              !channels.some((channel) => channel.id === 'slack' && channel.rich)
-            )
-              return transport.post(input);
+            if (row.provider !== 'slack') return transport.post(input);
+            const richEnabled = channels.some((channel) => channel.id === 'slack' && channel.rich);
             const context = (
               await database.query<{
                 session_id: string;
@@ -1571,16 +1647,37 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                 turn_id: string;
                 approval: boolean;
               }>(
-                `SELECT u.session_id,u.thread_id,u.id AS turn_id,EXISTS(SELECT 1 FROM approvals a WHERE a.owner_id=m.owner_id AND a.confirmation_message_id=m.id) AS approval
+                `SELECT u.session_id,u.thread_id,u.id AS turn_id,${hasApprovals ? 'EXISTS(SELECT 1 FROM approvals a WHERE a.owner_id=m.owner_id AND a.confirmation_message_id=m.id)' : 'false'} AS approval
              FROM messages m JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id WHERE m.id=$1 AND m.owner_id=$2`,
                 [row.message_id, ownerId],
               )
             ).rows[0];
-            if (context && !context.approval)
+            if (richEnabled && context && !context.approval)
               await rich.prepare(context.session_id, context.turn_id);
             const root = context
               ? await rich.root(row, context.session_id, context.turn_id)
               : undefined;
+            const rootMessageId = richEnabled && !context?.approval ? root?.root_id : undefined;
+            const provenance = await database.query(
+              `UPDATE channel_outbox o SET dispatched_root_id=$3,dispatched_installation_id=$4,
+               answer_conversation_id=(SELECT b.conversation_id FROM channel_main_turns b JOIN channel_main_conversations c ON c.id=b.conversation_id
+                 WHERE b.owner_id=$5 AND b.turn_id=$6 AND c.root_id=$3 AND c.installation_id=$4
+                   AND c.account_id=$7 AND c.sender_id=$8 AND c.dm=$9)
+               WHERE o.message_id=$1 AND o.claim_id=$2 AND o.state='sending' RETURNING o.message_id`,
+              [
+                row.message_id,
+                claimId,
+                rootMessageId ?? null,
+                channels.find((channel) => channel.id === 'slack')?.installationId ?? null,
+                ownerId,
+                context?.turn_id ?? null,
+                row.account_id,
+                row.sender_id,
+                row.thread_id,
+              ],
+            );
+            if (!provenance.rowCount) return undefined;
+            if (!richEnabled) return transport.post(input);
             const safe = channelText(row.text);
             const stream =
               context &&
@@ -1615,7 +1712,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               ...input,
               signal: receiving.signal,
               deliveryId: row.message_id,
-              ...(!context?.approval && root?.root_id ? { rootMessageId: root.root_id } : {}),
+              ...(rootMessageId ? { rootMessageId } : {}),
               ...(stream ? { stream } : {}),
             });
           })();

@@ -3,7 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { MessagingControl, MessagingTransport } from '../ports/messaging.ts';
 import { transaction } from './transaction.ts';
 import { logFailure } from './failure-log.ts';
-import { workOriginSql } from './turn-chain.ts';
+import { laterSupersedingTurnSql, waitingTurnSql, workOriginSql } from './turn-chain.ts';
 import { z } from 'zod';
 
 interface Root {
@@ -27,6 +27,17 @@ interface Root {
   current?: boolean;
   installation_id?: string;
 }
+
+type AnswerScope =
+  | { kind: 'legacy' }
+  | { kind: 'refused' }
+  | {
+      kind: 'main';
+      conversationId: string | null;
+      turnId: string;
+      messageId: string;
+      requestId: string | null;
+    };
 
 export async function createChannelRich(
   pool: Pool,
@@ -69,6 +80,12 @@ export async function createChannelRich(
     CREATE INDEX IF NOT EXISTS channel_main_dirty ON channel_main_work(owner_id,turn_id)
       WHERE last_status IS NULL OR last_status IN ('processing','suspended');
     CREATE INDEX IF NOT EXISTS channel_main_conversation_work ON channel_main_work(owner_id,conversation_id,turn_id);`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS channel_main_turns (
+    owner_id text NOT NULL,turn_id uuid PRIMARY KEY,conversation_id uuid NOT NULL REFERENCES channel_main_conversations(id),turn_created_at timestamptz NOT NULL);
+    CREATE INDEX IF NOT EXISTS channel_main_answer_turn ON channel_main_turns(owner_id,conversation_id,turn_created_at DESC,turn_id DESC);
+    CREATE INDEX IF NOT EXISTS messages_main_answer ON messages(owner_id,turn_id,created_at DESC,id DESC) WHERE role='assistant';
+    CREATE INDEX IF NOT EXISTS turns_main_answer_started ON turns(owner_id,session_id,started_at) WHERE started_at IS NOT NULL;`);
+  const hasApprovals = (await pool.query("SELECT to_regclass('approvals') AS name")).rows[0]?.name;
   await pool.query(
     "UPDATE channel_roots SET state='uncertain',nonce=NULL WHERE owner_id=$1 AND state='preparing'",
     [options.ownerId],
@@ -133,9 +150,10 @@ export async function createChannelRich(
       return;
     const turn = (
       await client.query(
-        `SELECT u.thread_id,u.session_id FROM turns u JOIN threads th ON th.owner_id=u.owner_id AND th.id=u.thread_id
-       WHERE u.id=$1 AND u.owner_id=$2 AND u.session_id=u.thread_id AND u.source='user' AND NOT u.proactive AND th.archived_at IS NULL`,
-        [turnId, options.ownerId],
+        `SELECT u.thread_id,u.session_id,u.created_at::text AS created_at FROM turns u JOIN threads th ON th.owner_id=u.owner_id AND th.id=u.thread_id
+       JOIN messages m ON m.id=$3 AND m.turn_id=u.id AND m.owner_id=u.owner_id AND m.role='user'
+       WHERE u.id=$1 AND u.owner_id=$2 AND u.session_id=u.thread_id AND u.source IN ('user','resume') AND NOT u.proactive AND th.archived_at IS NULL`,
+        [turnId, options.ownerId, targetId],
       )
     ).rows[0];
     if (!turn) return;
@@ -173,6 +191,19 @@ export async function createChannelRich(
       )
     ).rows[0];
     if (!conversation) throw new Error('The Slack conversation binding has changed.');
+    await client.query(
+      `INSERT INTO channel_main_turns(owner_id,turn_id,conversation_id,turn_created_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+      [options.ownerId, turnId, conversation.id, turn.created_at],
+    );
+    if (
+      !(
+        await client.query(
+          'SELECT 1 FROM channel_main_turns WHERE owner_id=$1 AND turn_id=$2 AND conversation_id=$3',
+          [options.ownerId, turnId, conversation.id],
+        )
+      ).rowCount
+    )
+      throw new Error('The Slack answer binding has changed.');
     if (!rich()) return;
     used = true;
     await client.query(
@@ -189,11 +220,138 @@ export async function createChannelRich(
          WHERE u.id=$1 AND u.owner_id=$2 AND u.session_id=u.thread_id AND u.source='resume' AND NOT u.proactive
          UNION ALL SELECT p.id,p.parent_turn_id,p.owner_id,p.thread_id,p.channel,c.depth+1 FROM lineage c JOIN turns p
            ON p.id=c.parent_turn_id AND p.owner_id=c.owner_id AND p.thread_id=c.thread_id AND p.channel=c.channel WHERE c.depth<200)
-       INSERT INTO channel_main_work(owner_id,turn_id,conversation_id,generation,connection_revision)
-       SELECT $2,$1,w.conversation_id,$3,$4 FROM lineage l JOIN channel_main_work w ON w.turn_id=l.id AND w.owner_id=$2
-       JOIN channel_main_conversations c ON c.id=w.conversation_id AND c.installation_id=$5 ORDER BY l.depth LIMIT 1 ON CONFLICT DO NOTHING`,
-      [turnId, options.ownerId, randomUUID(), revision, installation() ?? null],
+       INSERT INTO channel_main_turns(owner_id,turn_id,conversation_id,turn_created_at)
+       SELECT $2,$1,b.conversation_id,u.created_at FROM lineage l JOIN channel_main_turns b ON b.turn_id=l.id AND b.owner_id=$2
+       JOIN turns u ON u.id=$1 AND u.owner_id=$2
+       JOIN channel_main_conversations c ON c.id=b.conversation_id AND c.installation_id=$3 ORDER BY l.depth LIMIT 1 ON CONFLICT DO NOTHING`,
+      [turnId, options.ownerId, installation() ?? null],
     );
+    if (rich())
+      await pool.query(
+        `INSERT INTO channel_main_work(owner_id,turn_id,conversation_id,generation,connection_revision)
+         SELECT owner_id,turn_id,conversation_id,$3,$4 FROM channel_main_turns WHERE owner_id=$1 AND turn_id=$2 ON CONFLICT DO NOTHING`,
+        [options.ownerId, turnId, randomUUID(), revision],
+      );
+  }
+
+  async function resolveAnswer(
+    database: Pool | PoolClient,
+    identity: { account_id: string; sender_id: string },
+    dm: string,
+    root: string,
+    purpose: 'ordinary' | 'verification',
+    exactMessageId?: string,
+  ): Promise<AnswerScope> {
+    if (!options.permitted({ ...identity, provider: 'slack' })) return { kind: 'refused' };
+    const conversation = (
+      await database.query(
+        `SELECT c.id,c.thread_id,c.session_id,(c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.installation_id=$6 AND th.archived_at IS NULL) AS allowed
+         FROM channel_main_conversations c JOIN threads th ON th.id=c.thread_id AND th.owner_id=c.owner_id
+         WHERE c.owner_id=$1 AND c.root_id=$5 ORDER BY (c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.installation_id=$6) DESC LIMIT 1`,
+        [
+          options.ownerId,
+          identity.account_id,
+          identity.sender_id,
+          dm,
+          root,
+          installation() ?? null,
+        ],
+      )
+    ).rows[0];
+    if (conversation && !conversation.allowed) return { kind: 'refused' };
+    if (!conversation && !exactMessageId) return { kind: 'legacy' };
+    const binding = conversation
+      ? (
+          await database.query(
+            `SELECT turn_id FROM channel_main_turns WHERE owner_id=$1 AND conversation_id=$2 ORDER BY turn_created_at DESC,turn_id DESC LIMIT 1`,
+            [options.ownerId, conversation.id],
+          )
+        ).rows[0]
+      : undefined;
+    if (conversation && !binding) return { kind: 'refused' };
+    const row = (
+      await database.query(
+        `WITH latest AS MATERIALIZED (
+           SELECT m.* FROM messages m WHERE m.owner_id=$1 AND m.role='assistant' AND m.turn_id=COALESCE($2::uuid,
+             (SELECT turn_id FROM messages WHERE owner_id=$1 AND id=$3::uuid)) ORDER BY m.created_at DESC,m.id DESC LIMIT 1)
+         SELECT m.id,m.turn_id,m.hidden_at,u.status,u.waiting_reason,u.withdrawn,u.session_id,u.thread_id,u.channel,u.created_at::text AS created_at,u.started_at::text AS started_at,
+           o.state,o.delivery_only,o.provider_message_ids,o.answer_conversation_id,o.dispatched_root_id,o.dispatched_installation_id,
+           i.account_id,i.sender_id,i.thread_id AS dm,i.installation_id,i.channel AS receipt_channel,
+           EXISTS(SELECT 1 FROM threads th WHERE th.id=u.thread_id AND th.owner_id=$1 AND th.archived_at IS NULL) AS active,
+           ${hasApprovals ? 'EXISTS(SELECT 1 FROM approvals a WHERE a.owner_id=$1 AND a.confirmation_message_id=m.id)' : 'false'} AS approval
+         FROM latest m JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id
+         LEFT JOIN channel_outbox o ON o.message_id=m.id LEFT JOIN channel_inbox i ON i.source_id=o.source_id`,
+        [options.ownerId, binding?.turn_id ?? null, exactMessageId ?? null],
+      )
+    ).rows[0];
+    if (
+      !row ||
+      row.hidden_at ||
+      row.withdrawn ||
+      !row.active ||
+      row.session_id !== row.thread_id ||
+      row.state !== 'sent' ||
+      row.delivery_only ||
+      !row.provider_message_ids?.length ||
+      row.account_id !== identity.account_id ||
+      row.sender_id !== identity.sender_id ||
+      row.dm !== dm ||
+      row.channel !== row.receipt_channel ||
+      (conversation &&
+        (row.thread_id !== conversation.thread_id ||
+          row.session_id !== conversation.session_id ||
+          row.answer_conversation_id !== conversation.id ||
+          row.dispatched_root_id !== root ||
+          row.dispatched_installation_id !== installation())) ||
+      (!conversation &&
+        (row.id !== exactMessageId ||
+          !row.provider_message_ids.includes(root) ||
+          row.dispatched_root_id !== null ||
+          row.installation_id !== installation())) ||
+      row.approval
+    )
+      return { kind: 'refused' };
+    const current = (
+      await database.query(
+        `SELECT NOT ${laterSupersedingTurnSql} AS question_current,(${waitingTurnSql('u', 'credentials')}) AS credentials_current
+         FROM (SELECT $1::text AS owner_id,$2::uuid AS session_id,$3::timestamptz AS created_at,$4::uuid AS id,
+           $5::timestamptz AS started_at,$6::text AS status,$7::text AS waiting_reason,$8::uuid AS thread_id) u`,
+        [
+          options.ownerId,
+          row.session_id,
+          row.created_at,
+          row.turn_id,
+          row.started_at,
+          row.status,
+          row.waiting_reason,
+          row.thread_id,
+        ],
+      )
+    ).rows[0];
+    let requestId: string | null = null;
+    if (purpose === 'verification') {
+      if (!current.credentials_current) return { kind: 'refused' };
+      const request = await database.query(
+        `SELECT q.request_id FROM chat_verification_questions q JOIN credential_requests r ON r.id=q.request_id
+           WHERE q.message_id=$1 AND r.owner_id=$2 AND r.turn_id=$3 AND r.thread_id=$4 AND r.status='pending' AND r.kind='otp' LIMIT 2`,
+        [row.id, options.ownerId, row.turn_id, row.thread_id],
+      );
+      if (request.rowCount !== 1) return { kind: 'refused' };
+      requestId = request.rows[0].request_id;
+    } else if (!(
+      row.status === 'succeeded' ||
+      (row.status === 'waiting' && row.waiting_reason === 'question' && current.question_current)
+    ))
+      return { kind: 'refused' };
+    if (!conversation && row.status === 'succeeded' && !current.question_current)
+      return { kind: 'refused' };
+    return {
+      kind: 'main',
+      conversationId: conversation?.id ?? null,
+      turnId: row.turn_id,
+      messageId: row.id,
+      requestId,
+    };
   }
 
   async function mainRoot(turnId: string): Promise<Root | undefined> {
@@ -791,6 +949,7 @@ export async function createChannelRich(
   timer.unref();
   return {
     bindMain,
+    resolveAnswer,
     status: desiredStatus,
     async resolveMain(
       identity: { account_id: string; sender_id: string },
