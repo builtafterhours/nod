@@ -842,24 +842,46 @@ async function withdraw(client: PoolClient, turnIds: string[], wholeRequest: boo
 export async function cancelTurns(
   client: PoolClient,
   threadId: string,
-  scope: { sessionId?: string; background?: boolean } = {},
+  scope: {
+    sessionId?: string;
+    background?: boolean;
+    expectedTurnId?: string;
+    channel?: string;
+  } = {},
   analytics?: CaptureAnalytics,
   actor: 'owner' | 'agent' = 'owner',
 ) {
   const capture = snapshotAnalytics(analytics);
+  if (scope.channel && !scope.expectedTurnId) throw new Error('The stop target is incomplete.');
+  if (scope.expectedTurnId) {
+    if (!scope.sessionId || !scope.channel) throw new Error('The stop target is incomplete.');
+    const current = await client.query(
+      `SELECT 1 FROM turns WHERE id=$1 AND owner_id=$2 AND thread_id=$3 AND session_id=$4
+       AND channel=$5 AND status='running'`,
+      [scope.expectedTurnId, ownerId, threadId, scope.sessionId, scope.channel],
+    );
+    if (!current.rowCount) throw new Error('The work is no longer running in this channel.');
+  }
   if (!scope.sessionId && !scope.background) {
     nextStop.abort();
     nextStop = new AbortController();
   }
-  const values = [threadId, ownerId, scope.sessionId ?? null, scope.background ?? false];
+  const values = [
+    threadId,
+    ownerId,
+    scope.sessionId ?? null,
+    scope.background ?? false,
+    scope.expectedTurnId ?? null,
+    scope.channel ?? null,
+  ];
   const candidates = await client.query<{ id: string; live: boolean }>(
     `SELECT u.id,u.status<>'waiting' OR NOT ${laterSupersedingTurnSql} AS live FROM turns u
-     WHERE u.thread_id=$1 AND u.owner_id=$2 AND ($3::uuid IS NULL OR u.session_id=$3) AND (NOT $4 OR u.session_id<>$1) AND u.status IN ('queued','running','waiting')`,
+     WHERE u.thread_id=$1 AND u.owner_id=$2 AND ($3::uuid IS NULL OR u.session_id=$3) AND (NOT $4 OR u.session_id<>$1) AND ($5::uuid IS NULL OR u.id=$5) AND ($6::text IS NULL OR u.channel=$6) AND u.status IN ('queued','running','waiting')`,
     values,
   );
   abortTurns(candidates.rows.map(({ id }) => id));
   const current = await client.query(
-    "UPDATE turns SET status='cancelled',finished_at=now() WHERE thread_id=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR session_id=$3) AND (NOT $4 OR session_id<>$1) AND status IN ('queued','running','waiting') RETURNING id,session_id",
+    "UPDATE turns SET status='cancelled',finished_at=now() WHERE thread_id=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR session_id=$3) AND (NOT $4 OR session_id<>$1) AND ($5::uuid IS NULL OR id=$5) AND ($6::text IS NULL OR channel=$6) AND status IN ('queued','running','waiting') RETURNING id,session_id",
     values,
   );
   if (actor === 'owner') {
@@ -874,7 +896,7 @@ export async function cancelTurns(
     await client.query(
       `SELECT DISTINCT to_jsonb(u)->>'task_id' AS id FROM turns u
        WHERE u.thread_id=$1 AND u.owner_id=$2 AND ($3::uuid IS NULL OR u.session_id=$3) AND (NOT $4 OR u.session_id<>$1)
-         AND to_jsonb(u)->>'task_id' IS NOT NULL`,
+         AND ($5::uuid IS NULL OR u.id=$5) AND ($6::text IS NULL OR u.channel=$6) AND to_jsonb(u)->>'task_id' IS NOT NULL`,
       values,
     )
   ).rows.map((row) => row.id);

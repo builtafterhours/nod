@@ -431,6 +431,8 @@ export function Channels() {
       connected: Boolean(setup?.enabled || configured),
       available: live?.available,
       error: live?.error,
+      rich: live?.rich,
+      richError: live?.richError,
     };
   });
   const telegramSetup = channels[0].setup;
@@ -751,6 +753,8 @@ export function Channels() {
               )}
               {editing === 'slack' && (
                 <>
+                  {(selected?.setup?.richEnabled || selected?.rich) && <p>Rich Slack requested</p>}
+                  {selected?.richError && <Notice kind="error">{selected.richError}</Notice>}
                   {(error || selected?.error) && (
                     <Notice kind="error">{error || selected?.error}</Notice>
                   )}
@@ -765,7 +769,12 @@ export function Channels() {
                     <Button
                       variant="outline"
                       disabled={busy}
-                      onClick={() => setFields({ connection: 'socket' })}
+                      onClick={() =>
+                        setFields({
+                          connection: 'socket',
+                          richEnabled: String(selected?.setup?.richEnabled === true),
+                        })
+                      }
                     >
                       Update connection
                     </Button>
@@ -829,6 +838,19 @@ export function Channels() {
                     />
                   </Field>
                 ))}
+                <label className="channel-policy">
+                  <Checkbox
+                    checked={fields.richEnabled === 'true'}
+                    disabled={busy || !settings?.ready}
+                    onChange={(event) =>
+                      setFields((current) => ({
+                        ...current,
+                        richEnabled: String(event.target.checked),
+                      }))
+                    }
+                  />
+                  <span>Rich Slack (requires agent setup)</span>
+                </label>
                 {(error || loadError) && <Notice kind="error">{error || loadError}</Notice>}
                 <div className="dialog-actions">
                   <Button type="submit" disabled={busy || !settings?.ready}>

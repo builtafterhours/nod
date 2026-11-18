@@ -6,6 +6,17 @@ export function combineMessagingTransports(
   const forChannel = (id: string) =>
     transports.findLast((transport) => transport.channels.some((channel) => channel.id === id));
   return {
+    controls(accept) {
+      const releases = transports.map((transport) =>
+        transport.controls?.((input) =>
+          forChannel(input.channelId) === transport ? accept(input) : Promise.resolve(),
+        ),
+      );
+      return () => releases.forEach((release) => release?.());
+    },
+    async conversation(input) {
+      return (await forChannel(input.channelId)?.conversation?.(input)) ?? {};
+    },
     get channels() {
       return [
         ...new Map(

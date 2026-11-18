@@ -415,6 +415,7 @@ export interface ChannelLinkStatus {
   error?: string;
 }
 export interface ChannelSetupSummary {
+  richEnabled?: boolean;
   provider: ChannelProvider;
   enabled: boolean;
   managed?: boolean;

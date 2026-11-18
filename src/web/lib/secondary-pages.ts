@@ -102,6 +102,8 @@ export function removeConnection(connections: Connection[], connectionId: string
 }
 
 type ChannelStatus = {
+  rich?: boolean;
+  richError?: string;
   provider: string;
   status: 'disabled' | 'setup_required' | 'configured';
   missing: string[];
@@ -162,6 +164,7 @@ export function channelSetupBody(
       appToken: fields.appToken?.trim(),
       teamId: fields.teamId?.trim(),
       allowedUserId: fields.allowedUserId?.trim(),
+      richEnabled: fields.richEnabled === 'true',
     };
   if (provider === 'telegram')
     return {
