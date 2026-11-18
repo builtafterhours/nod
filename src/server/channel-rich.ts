@@ -65,6 +65,19 @@ export async function createChannelRich(
     root_id text,target_id uuid,nonce uuid,status_nonce uuid,expires_at timestamptz,control_message_id text,state text NOT NULL DEFAULT 'preparing',last_status text,lifecycle_revision bigint NOT NULL DEFAULT 0,
     PRIMARY KEY(owner_id,account_id,sender_id,dm,session_id));
     CREATE TABLE IF NOT EXISTS channel_controls(owner_id text NOT NULL,event_id text NOT NULL,PRIMARY KEY(owner_id,event_id));
+    ALTER TABLE channel_controls ADD COLUMN IF NOT EXISTS kind text;
+    ALTER TABLE channel_controls ADD COLUMN IF NOT EXISTS turn_id uuid;
+    ALTER TABLE channel_controls ADD COLUMN IF NOT EXISTS connection_revision uuid;
+    ALTER TABLE channel_controls ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+    ALTER TABLE channel_controls ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
+    CREATE INDEX IF NOT EXISTS channel_controls_bound ON channel_controls(owner_id,turn_id) WHERE turn_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS channel_control_intents(
+      owner_id text NOT NULL,installation_id text NOT NULL,event_id text NOT NULL,
+      seq bigserial NOT NULL,connection_revision uuid NOT NULL,control jsonb NOT NULL,
+      state text NOT NULL DEFAULT 'pending',outcome text,received_at timestamptz NOT NULL DEFAULT now(),settled_at timestamptz,
+      PRIMARY KEY(owner_id,installation_id,event_id),CHECK ((state='pending') = (settled_at IS NULL)));
+    CREATE INDEX IF NOT EXISTS channel_control_intents_pending ON channel_control_intents(owner_id,seq) WHERE state='pending';
+    CREATE INDEX IF NOT EXISTS channel_control_intents_settled ON channel_control_intents(owner_id,settled_at) WHERE state<>'pending';
     CREATE TABLE IF NOT EXISTS channel_streams(owner_id text NOT NULL,message_id uuid NOT NULL,part integer NOT NULL,
       account_id text NOT NULL,sender_id text NOT NULL,dm text NOT NULL,session_id uuid NOT NULL,turn_id uuid NOT NULL,
       root_id text NOT NULL,revision uuid NOT NULL,provider_id text,state text NOT NULL,confirmed_chars integer NOT NULL DEFAULT 0,
@@ -119,6 +132,10 @@ export async function createChannelRich(
   ]);
   await pool.query(
     "UPDATE channel_streams SET state='uncertain' WHERE owner_id=$1 AND state NOT IN ('finalized','uncertain')",
+    [options.ownerId],
+  );
+  await pool.query(
+    "UPDATE channel_control_intents SET state='expired',outcome='restart',settled_at=now() WHERE owner_id=$1 AND state='pending'",
     [options.ownerId],
   );
   let closed = false;
@@ -546,28 +563,139 @@ export async function createChannelRich(
     }
   }
 
-  async function accept(input: MessagingControl) {
+  const controlSchema = z.object({
+    channelId: z.literal('slack'),
+    accountId: z.string().min(1).max(100),
+    senderId: z.string().min(1).max(100),
+    threadId: z.string().min(1).max(100),
+    eventId: z.string().min(1).max(500),
+    rootMessageId: z.string().min(1).max(100),
+    action: z.enum(['stop', 'status']),
+    nonce: z.uuid().optional(),
+    messageId: z.string().max(100).optional(),
+    streamIds: z.array(z.string().min(1).max(100)).max(50).optional(),
+    installationId: z.string().min(1).max(100).optional(),
+  });
+  const attempted = new Set<string>();
+  let draining: Promise<void> | undefined;
+  let drainAgain = false;
+  let nextCleanup = Date.now() + 600_000;
+
+  async function intake(input: MessagingControl) {
+    if (!controlSchema.safeParse(input).success) return;
+    const recorded = revision;
     if (
-      !z
-        .object({
-          channelId: z.literal('slack'),
-          accountId: z.string().min(1).max(100),
-          senderId: z.string().min(1).max(100),
-          threadId: z.string().min(1).max(100),
-          eventId: z.string().min(1).max(500),
-          rootMessageId: z.string().min(1).max(100),
-          action: z.enum(['stop', 'status']),
-          nonce: z.uuid().optional(),
-          messageId: z.string().max(100).optional(),
-          streamIds: z.array(z.string().min(1).max(100)).max(50).optional(),
-          installationId: z.string().min(1).max(100).optional(),
-        })
-        .safeParse(input).success
+      closed ||
+      lifetime.signal.aborted ||
+      !rich() ||
+      !input.installationId ||
+      input.installationId !== installation()
     )
+      throw new Error('Slack control was not recorded: the Slack connection is not ready.');
+    const key = [options.ownerId, input.installationId, input.eventId];
+    const inserted = await pool.query(
+      `INSERT INTO channel_control_intents(owner_id,installation_id,event_id,connection_revision,control)
+       SELECT $1,$2,$3,$4,$5 WHERE (SELECT count(*) FROM channel_control_intents WHERE owner_id=$1 AND state='pending')<32
+       ON CONFLICT DO NOTHING RETURNING seq`,
+      [...key, recorded, input],
+    );
+    if (
+      !inserted.rowCount &&
+      !(
+        await pool.query(
+          'SELECT 1 FROM channel_control_intents WHERE owner_id=$1 AND installation_id=$2 AND event_id=$3',
+          key,
+        )
+      ).rowCount
+    )
+      throw new Error('Slack control was not recorded: 32 controls are already waiting.');
+    drainControls();
+  }
+
+  function drainControls() {
+    if (draining) {
+      drainAgain = true;
       return;
-    if (closed || lifetime.signal.aborted || !rich() || input.channelId !== 'slack') return;
+    }
+    draining = (async () => {
+      do {
+        drainAgain = false;
+        await drainPass();
+      } while (drainAgain && !closed);
+    })()
+      .catch((cause) => logFailure('channel_control_failed', cause))
+      .finally(() => {
+        draining = undefined;
+      });
+  }
+
+  async function drainPass() {
+    for (;;) {
+      if (closed) return;
+      const pending = (
+        await pool.query<{
+          installation_id: string;
+          event_id: string;
+          connection_revision: string;
+          control: unknown;
+        }>(
+          "SELECT installation_id,event_id,connection_revision,control FROM channel_control_intents WHERE owner_id=$1 AND state='pending' ORDER BY seq LIMIT 50",
+          [options.ownerId],
+        )
+      ).rows.filter((intent) => !attempted.has(`${intent.installation_id}:${intent.event_id}`));
+      if (!pending.length) break;
+      for (const intent of pending.slice(0, 8)) await apply(intent);
+    }
+    if (Date.now() >= nextCleanup) {
+      nextCleanup = Date.now() + 600_000;
+      await cleanup();
+    }
+  }
+
+  async function apply(intent: {
+    installation_id: string;
+    event_id: string;
+    connection_revision: string;
+    control: unknown;
+  }) {
+    const id = `${intent.installation_id}:${intent.event_id}`;
+    const key = [options.ownerId, intent.installation_id, intent.event_id];
     const signal = lifetime.signal;
+    attempted.add(id);
     const after = await (options.cancel ?? ((work) => transaction(work, pool)))(async (client) => {
+      const settle = async (outcome: string, finish?: () => Promise<void>) => {
+        await client.query(
+          'UPDATE channel_control_intents SET state=$4,outcome=$5,settled_at=now() WHERE owner_id=$1 AND installation_id=$2 AND event_id=$3',
+          [
+            ...key,
+            outcome === 'stop' || outcome === 'status'
+              ? 'applied'
+              : outcome === 'age'
+                ? 'expired'
+                : 'refused',
+            outcome,
+          ],
+        );
+        return finish;
+      };
+      const pending = (
+        await client.query<{ old: boolean }>(
+          "SELECT received_at<now()-interval '15 minutes' AS old FROM channel_control_intents WHERE owner_id=$1 AND installation_id=$2 AND event_id=$3 AND state='pending' FOR UPDATE",
+          key,
+        )
+      ).rows[0];
+      if (!pending) return;
+      if (pending.old) return settle('age');
+      if (intent.connection_revision !== revision) return settle('revision');
+      const parsed = controlSchema.safeParse(intent.control);
+      if (
+        !parsed.success ||
+        parsed.data.installationId !== intent.installation_id ||
+        intent.installation_id !== installation()
+      )
+        return settle('installation');
+      const input = parsed.data;
+      if (closed || signal.aborted || !rich()) return settle('closed');
       await options.lock?.(client);
       let row = (
         await client.query<Root>(
@@ -603,7 +731,8 @@ export async function createChannelRich(
         ).rows[0];
         main = Boolean(row);
       }
-      if (!row || !permitted(row) || closed || lifetime.signal.aborted) return;
+      if (!row || !permitted(row) || closed || lifetime.signal.aborted)
+        return settle('not_current');
       if (
         input.nonce
           ? input.nonce !== (input.action === 'stop' ? row.nonce : row.status_nonce) ||
@@ -612,7 +741,7 @@ export async function createChannelRich(
             row.expires_at.getTime() <= Date.now()
           : !input.streamIds?.length || input.action !== 'stop'
       )
-        return;
+        return settle(input.nonce ? 'stale_nonce' : 'stream');
       if (!input.nonce) {
         const streams = await client.query(
           `SELECT provider_id FROM channel_streams WHERE owner_id=$1 AND account_id=$2 AND sender_id=$3 AND dm=$4 AND root_id=$5
@@ -629,24 +758,32 @@ export async function createChannelRich(
             input.streamIds,
           ],
         );
-        if (streams.rowCount !== new Set(input.streamIds).size) return;
+        if (streams.rowCount !== new Set(input.streamIds).size) return settle('stream');
       }
       const current = await client.query(
         "SELECT 1 FROM turns WHERE id=$1 AND owner_id=$2 AND session_id=$3 AND thread_id=$4 AND channel=$5 AND status='running'",
         [row.turn_id, options.ownerId, row.session_id, row.thread_id, row.channel],
       );
-      if (!current.rowCount || signal.aborted) return;
+      if (!current.rowCount || signal.aborted) return settle('not_current');
       const claim = await client.query(
-        'INSERT INTO channel_controls(owner_id,event_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING event_id',
-        [options.ownerId, input.eventId],
+        `INSERT INTO channel_controls(owner_id,event_id,kind,turn_id,connection_revision,expires_at,claimed_at)
+         VALUES($1,$2,$3,$4,$5,$6,now()) ON CONFLICT DO NOTHING RETURNING event_id`,
+        [
+          options.ownerId,
+          input.eventId,
+          input.nonce ? 'nonce' : 'stream',
+          row.turn_id,
+          revision,
+          input.nonce ? row.expires_at : null,
+        ],
       );
-      if (!claim.rowCount) return;
+      if (!claim.rowCount) return settle('claimed');
       if (input.action === 'status') {
         shown.delete(row.session_id);
         if (main) shown.delete(`main:${row.turn_id}`);
-        return;
+        return settle('status');
       }
-      if (!options.control) return;
+      if (!options.control) return settle('not_current');
       signal.throwIfAborted();
       const finish = await options.control(client, {
         threadId: row.thread_id,
@@ -667,15 +804,53 @@ export async function createChannelRich(
           'UPDATE channel_main_work SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1 AND turn_id=$2',
           [options.ownerId, row.turn_id],
         );
-      return finish;
-    });
-    await after?.();
+      return settle('stop', finish);
+    }).then(
+      (finish) => {
+        attempted.delete(id);
+        return finish;
+      },
+      async (cause) => {
+        logFailure('channel_control_failed', cause);
+        await pool
+          .query(
+            "UPDATE channel_control_intents SET state='failed',outcome='error',settled_at=now() WHERE owner_id=$1 AND installation_id=$2 AND event_id=$3 AND state='pending'",
+            key,
+          )
+          .then(() => attempted.delete(id))
+          .catch((markCause) => logFailure('channel_control_failed', markCause));
+        return undefined;
+      },
+    );
+    if (after) void after().catch((cause) => logFailure('channel_control_failed', cause));
+  }
+
+  async function cleanup() {
+    for (let batch = 0; batch < 10; batch++) {
+      const claims = await pool.query(
+        `DELETE FROM channel_controls c USING (
+           SELECT owner_id,event_id FROM channel_controls x WHERE x.owner_id=$1 AND x.turn_id IS NOT NULL AND (
+             x.connection_revision IS DISTINCT FROM $2::uuid
+             OR (x.kind='nonce' AND x.expires_at<=now())
+             OR NOT EXISTS(SELECT 1 FROM turns u WHERE u.id=x.turn_id AND u.owner_id=x.owner_id AND u.status='running'))
+           LIMIT 500) d WHERE c.owner_id=d.owner_id AND c.event_id=d.event_id`,
+        [options.ownerId, revision],
+      );
+      const intents = await pool.query(
+        `DELETE FROM channel_control_intents i USING (
+           SELECT owner_id,installation_id,event_id FROM channel_control_intents WHERE owner_id=$1 AND state<>'pending'
+             AND settled_at<now()-interval '1 hour' LIMIT 500) d
+         WHERE i.owner_id=d.owner_id AND i.installation_id=d.installation_id AND i.event_id=d.event_id`,
+        [options.ownerId],
+      );
+      if ((claims.rowCount ?? 0) < 500 && (intents.rowCount ?? 0) < 500) return;
+    }
   }
 
   function listen() {
     release?.();
     release = options.transport().controls?.((input) =>
-      accept(input).catch((cause) => {
+      intake(input).catch((cause) => {
         logFailure('channel_control_failed', cause);
         throw cause;
       }),
@@ -1092,8 +1267,12 @@ export async function createChannelRich(
       });
     running = pass;
   }
+  await cleanup();
   listen();
-  const timer = setInterval(refresh, 2000);
+  const timer = setInterval(() => {
+    refresh();
+    drainControls();
+  }, 2000);
   timer.unref();
   return {
     bindMain,
