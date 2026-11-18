@@ -38,10 +38,14 @@ const nextCheck = z.iso.datetime({ offset: true });
 const credentialUrl = /(?<![\w/])(?:[a-z][a-z\d+.-]*:)?\/\/[^/\s?#<>]*@/iu;
 const planSteps = z
   .array(
-    now.refine(
-      (title) => title.length <= 200,
-      'Plan titles must be at most 200 UTF-16 code units.',
-    ),
+    z
+      .string()
+      .refine(
+        (title) => title.length <= 200,
+        'Plan titles must be at most 200 raw UTF-16 code units.',
+      )
+      .trim()
+      .min(1),
   )
   .max(50);
 const planVersions = {
@@ -101,8 +105,6 @@ type Row = {
   step_index: number;
   revision: number;
   applied_revision: number;
-  owner_id: string;
-  session_id: string;
   plan_steps: Extract<NonNullable<Task['plan']>, { kind: 'structured' }>['steps'] | null;
   plan_revision: number;
   progress_revision: number;
@@ -193,7 +195,7 @@ export function createTasks(options: {
          )
          SELECT t.id,t.title,t.done_when,t.now_text,t.result,t.state,t.waiting_for,t.next_check,
            t.message_id,t.steps,t.step_index,t.revision,t.applied_revision,
-           t.owner_id,t.session_id,t.plan_steps,t.plan_revision,t.progress_revision,
+           t.plan_steps,t.plan_revision,t.progress_revision,
            t.created_at,t.updated_at,t.closed_at,COALESCE((SELECT r.status FROM turns r WHERE r.owner_id=t.owner_id AND r.session_id=t.session_id AND r.status='running'),u.status) AS turn_status,
            EXISTS(SELECT 1 FROM turns n WHERE n.owner_id=u.owner_id AND n.thread_id=u.thread_id
              AND n.session_id=u.session_id AND n.parent_turn_id=u.id) AS answered,
@@ -235,9 +237,7 @@ export function createTasks(options: {
         revision: row.revision,
         appliedRevision: row.applied_revision,
         plan: {
-          ownerId: row.owner_id,
           taskId: row.id,
-          sessionId: row.session_id,
           planRevision: row.plan_revision,
           progressRevision: row.progress_revision,
           ...(row.plan_steps === null
@@ -630,7 +630,7 @@ export function createTasks(options: {
         throw failure('Only the task session can change its progress or result.');
       if (request.action === 'update') {
         const task = (
-          await client.query<Row & { turn_id: string }>(
+          await client.query<Row & { turn_id: string; session_id: string }>(
             'SELECT * FROM tasks WHERE id=$1 AND owner_id=$2 FOR NO KEY UPDATE',
             [id, ownerId],
           )

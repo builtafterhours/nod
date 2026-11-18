@@ -293,9 +293,7 @@ export interface TaskWait {
   via: string;
 }
 export type TaskPlan = {
-  ownerId: string;
   taskId: string;
-  sessionId: string;
   planRevision: number;
   progressRevision: number;
 } & (
