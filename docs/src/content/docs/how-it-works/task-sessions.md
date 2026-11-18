@@ -65,7 +65,11 @@ The server checks owner and session bindings internally. Public plan snapshots e
 
 A changed or reordered replacement assigns all new step IDs and resets intent to pending. It advances both plan and progress revisions. An identical replacement can leave both unchanged. Starting a step advances only the progress revision. Titles and structured metadata save atomically. Legacy steps cannot overwrite structured state; callers must read the task and use a versioned replacement.
 
-This is an internal foundation. Channel views still use the existing titles and focus hint; they do not receive structured step state or native plan updates.
+For new bounded multi-step tasks, the task tool instructions prefer a structured plan. After applying the current owner instruction, the worker reads the task and explicitly starts a pending step by its returned ID and both revisions when beginning that work. Legacy callers and quick answers remain supported. Tool activity does not infer a start; omitting the explicit call leaves the step pending.
+
+Rich Slack task views receive a separate bounded presentation projection: revisions, message-local keys, ordinal labels and pending or reported-start intent, never descriptive step titles or internal bindings. Every entry has a text row and outcomes stay unverified. While the task is current and running, an optional **Reported starts** strip shows only explicitly started entries. It is not live execution telemetry or a completion meter. Waiting, corrections, queued work and ended tasks retain historical intent as text and remove the strip. Overall task disposition is separate from step outcomes. Invalid metadata shows unknown state rather than a truncated plan or legacy-title fallback.
+
+The view rechecks revisions, applied owner instructions, lifecycle and current task/turn binding after transport pacing and before dispatch or a definite-rejection fallback. Stale queued views are dropped. A request already dispatched cannot be retracted; a later current refresh can replace it on the same known message. An uncertain receipt never recreates the control view or changes task state. Other channels retain their existing views.
 
 ## Start, reply and finish
 
