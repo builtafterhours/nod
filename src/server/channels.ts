@@ -147,6 +147,8 @@ interface InboxRow extends ChannelIdentity {
   attachments: Artifact[];
   conversation_thread_id: string | null;
   media_usage_ids: string[];
+  canonical_root_id: string | null;
+  installation_id: string | null;
 }
 interface OutboxRow extends ChannelIdentity {
   message_id: string;
@@ -185,6 +187,8 @@ const messageSchema = z
       .optional(),
     sentAt: z.date(),
     replyToMessageId: z.string().min(1).optional(),
+    conversationRootMessageId: z.string().min(1).max(100).optional(),
+    installationId: z.string().min(1).max(100).optional(),
   })
   .refine((message) => Boolean(message.text || message.attachments?.length));
 const reactionSchema = z.object({
@@ -386,6 +390,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ALTER TABLE channel_inbox ADD COLUMN IF NOT EXISTS attachments jsonb NOT NULL DEFAULT '[]';
   ALTER TABLE channel_inbox ADD COLUMN IF NOT EXISTS conversation_thread_id uuid;
   ALTER TABLE channel_inbox ADD COLUMN IF NOT EXISTS media_usage_ids text[] NOT NULL DEFAULT '{}';
+  ALTER TABLE channel_inbox ADD COLUMN IF NOT EXISTS canonical_root_id text;
+  ALTER TABLE channel_inbox ADD COLUMN IF NOT EXISTS installation_id text;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS provider_message_ids text[] NOT NULL DEFAULT '{}';
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS presentation jsonb;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS claim_id uuid;
@@ -592,12 +598,17 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     identity: { provider: string; account_id: string; sender_id: string },
     threadId: string,
     providerId: string,
+    exact = false,
   ): Promise<string | undefined> {
+    let mainTarget: string | undefined;
     if (identity.provider === 'slack') {
       const target = await rich.resolve(identity, threadId, providerId);
-      if (target.known) return target.target;
+      if (target.known) return exact ? undefined : target.target;
+      const main = await rich.resolveMain(identity, threadId, providerId);
+      if (main.known && !main.target) return;
+      mainTarget = main.target;
     }
-    return (
+    const receipt = (
       await pool.query(
         `SELECT o.message_id FROM channel_outbox o JOIN channel_inbox i ON i.source_id=o.source_id
          JOIN messages m ON m.id=o.message_id AND m.owner_id=i.owner_id
@@ -618,6 +629,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         ],
       )
     ).rows[0]?.message_id;
+    if (receipt || exact || identity.provider !== 'slack') return receipt;
+    return mainTarget;
   }
 
   async function hiddenReplyTarget(database: Pool | PoolClient, messageId: string) {
@@ -637,11 +650,33 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         reason,
       });
     if (!parsed.success || parsed.data.channelId !== channelId) return dropped('invalid_message');
-    const { accountId, senderId, messageId, threadId, sentAt, replyToMessageId } = parsed.data;
+    const {
+      accountId,
+      senderId,
+      messageId,
+      threadId,
+      sentAt,
+      replyToMessageId,
+      conversationRootMessageId,
+      installationId,
+    } = parsed.data;
     let { text } = parsed.data;
     const identity = { provider: channelId, account_id: accountId, sender_id: senderId };
     if (closed || replacing) return;
     if (!permitted(identity)) return dropped('not_linked');
+    if (
+      channelId === 'slack' &&
+      conversationRootMessageId &&
+      conversationRootMessageId !== (replyToMessageId ?? messageId)
+    )
+      return dropped('root_mismatch');
+    if (
+      installationId &&
+      !transport.channels.some(
+        (channel) => channel.id === 'slack' && channel.installationId === installationId,
+      )
+    )
+      return dropped('installation_changed');
     if (sentAt.getTime() > Date.now() + 300000) return dropped('future_timestamp');
     let media: Awaited<ReturnType<ChannelMedia['prepare']>> | undefined;
     try {
@@ -787,8 +822,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         if (verification?.turnId && media?.usageIds.length)
           await options.attributeMediaUsage?.(database, media.usageIds, verification.turnId);
         await database.query(
-          `INSERT INTO channel_inbox(source_id,provider,account_id,sender_id,thread_id,text,received_at,message_id,state,turn_id,owner_id,channel,provider_reply_id,attachments,conversation_thread_id,media_usage_ids)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT(source_id) DO NOTHING`,
+          `INSERT INTO channel_inbox(source_id,provider,account_id,sender_id,thread_id,text,received_at,message_id,state,turn_id,owner_id,channel,provider_reply_id,attachments,conversation_thread_id,media_usage_ids,canonical_root_id,installation_id)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT(source_id) DO NOTHING`,
           [
             sourceId,
             channelId,
@@ -806,6 +841,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             JSON.stringify(attachments),
             conversationThreadId ?? null,
             media?.usageIds ?? [],
+            conversationRootMessageId ?? null,
+            installationId ?? null,
           ],
         );
         if (strict && (closed || replacing || receiveSignal.aborted || !permitted(identity)))
@@ -830,7 +867,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       if (verificationReply && options.acceptVerification) {
         try {
           const target = replyToMessageId
-            ? await nativeReply(identity, threadId, replyToMessageId)
+            ? await nativeReply(identity, threadId, replyToMessageId, true)
             : undefined;
           if (replyToMessageId && !target)
             throw Object.assign(new Error('The verification reply is unavailable.'), {
@@ -1021,6 +1058,9 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const resolvedReply = pending.provider_reply_id
       ? await nativeReply(pending, pending.thread_id, pending.provider_reply_id)
       : undefined;
+    const exactReply = pending.provider_reply_id
+      ? await nativeReply(pending, pending.thread_id, pending.provider_reply_id, true)
+      : undefined;
     const replyToMessageId =
       resolvedReply && pending.provider === 'slack'
         ? (
@@ -1054,6 +1094,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       command ||
       pending.attachments?.length ||
       (pending.provider === 'slack' && !replyToMessageId) ||
+      (pending.provider === 'slack' && exactReply !== replyToMessageId) ||
       (pending.provider === 'slack' &&
         !(
           hasApprovals &&
@@ -1182,6 +1223,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         "UPDATE channel_inbox SET state='submitted',turn_id=$2,message_id=$3,channel=$5 WHERE source_id=$1 AND owner_id=$4",
         [row.source_id, turnId, messageId, ownerId, channel],
       );
+      if (row.provider === 'slack') await rich.bindMain(client, row, turnId, messageId);
       return { acceptedChannel: inserted ? row.provider : undefined };
     }, pool).catch(async (cause) => {
       if (cause === replyTargetChanged) return true;
@@ -1508,14 +1550,17 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                 [row.message_id, ownerId],
               )
             ).rows[0];
-            if (context && !context.approval && context.session_id !== context.thread_id)
+            if (context && !context.approval)
               await rich.prepare(context.session_id, context.turn_id);
-            const root = context ? await rich.root(row, context.session_id) : undefined;
+            const root = context
+              ? await rich.root(row, context.session_id, context.turn_id)
+              : undefined;
             const safe = channelText(row.text);
             const stream =
               context &&
               root?.root_id &&
               root.turn_id === context.turn_id &&
+              root.current !== false &&
               !context.approval &&
               !safe.secureAction &&
               !safe.artifact &&
@@ -1525,6 +1570,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               !row.presentation &&
               !attachments?.length
                 ? {
+                    status: () => rich.status(row, root.root_id!),
                     record: rich.record(row, {
                       messageId: row.message_id,
                       sessionId: context.session_id,
