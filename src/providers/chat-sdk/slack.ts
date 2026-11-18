@@ -1004,6 +1004,7 @@ export function createSlackTransport(
           await richTable();
           if (!statusUnsupported) {
             try {
+              if (input.current && !(await input.current())) return {};
               const status = await viewWeb.agents.sessions.setStatus({
                 channel_id: dm,
                 thread_ts: root,
@@ -1037,27 +1038,89 @@ export function createSlackTransport(
             updateRichError();
             return {};
           }
-          const text = [
+          const header = [
             input.title,
-            input.outcome === 'failed'
-              ? 'Failed'
-              : input.outcome === 'cancelled'
-                ? 'Stopped'
-                : input.status === 'processing'
-                  ? 'Working'
-                  : input.status === 'suspended'
-                    ? 'Needs you'
-                    : input.status === 'closed'
-                      ? 'Closed'
-                      : 'Ready',
+            (input.task ? 'Overall task: ' : '') +
+              (input.outcome === 'failed'
+                ? 'Failed'
+                : input.outcome === 'cancelled'
+                  ? 'Stopped'
+                  : input.status === 'processing'
+                    ? 'Working'
+                    : input.status === 'suspended'
+                      ? 'Needs you'
+                      : input.status === 'closed'
+                        ? 'Closed'
+                        : 'Ready'),
             input.text,
-            ...(input.task?.steps ?? []).map((title, index) => `${index + 1}. ${title}`),
           ]
             .filter(Boolean)
             .join('\n');
-          const blocks: NonNullable<ChatStopStreamArguments['blocks']> = [
-            { type: 'section', text: { type: 'plain_text', text: text.slice(0, 2900) } },
+          const plan = input.task?.plan;
+          let planText =
+            plan?.kind === 'structured'
+              ? [
+                  'Reported intent; step outcomes are unverified.',
+                  'Reported starts do not verify live activity or effects.',
+                  ...(plan.steps.length
+                    ? plan.steps.map(
+                        (step) =>
+                          `Step ${step.ordinal}: ${step.intent === 'started' ? 'Started (reported)' : 'Pending'}`,
+                      )
+                    : ['No plan entries declared.']),
+                  ...(plan.activity === 'historical'
+                    ? ['Historical intent; not live activity.']
+                    : []),
+                ].join('\n')
+              : input.task
+                ? 'Plan states unknown. Step outcomes are unverified.'
+                : '';
+          const starts =
+            plan?.kind === 'structured' &&
+            plan.activity === 'current' &&
+            input.status === 'processing' &&
+            input.task?.state === 'open'
+              ? plan.steps.filter((step) => step.intent === 'started')
+              : [];
+          const nativePlan = starts.length
+            ? {
+                type: 'plan' as const,
+                title: 'Reported starts',
+                tasks: starts.map((step) => ({
+                  task_id: step.key,
+                  title: `Step ${step.ordinal}: Started (reported)`,
+                  status: 'in_progress' as const,
+                })),
+              }
+            : undefined;
+          const bounded =
+            planText.length <= 2400 &&
+            Buffer.byteLength(JSON.stringify({ planText, nativePlan }), 'utf8') <= 32 * 1024;
+          if (!bounded)
+            planText =
+              'Plan states unknown; reported intent unavailable. Step outcomes are unverified.';
+          const literalHeader = header
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;');
+          const budget = 4000 - planText.length - 1;
+          let text = [
+            literalHeader.length <= budget
+              ? literalHeader
+              : literalHeader
+                  .slice(0, budget - 4)
+                  .replace(/&[^;]*$/, '')
+                  .replace(/[\uD800-\uDBFF]$/, '') + '...',
+            planText,
+          ]
+            .filter(Boolean)
+            .join('\n');
+          let blocks: NonNullable<ChatStopStreamArguments['blocks']> = [
+            { type: 'section', text: { type: 'plain_text', text: header.slice(0, 2900) } },
           ];
+          if (planText)
+            blocks.push({ type: 'section', text: { type: 'plain_text', text: planText } });
+          if (nativePlan && bounded) blocks.push(nativePlan);
           if (input.task && !cardsUnsupported) {
             const status = input.outcome
               ? 'error'
@@ -1069,7 +1132,7 @@ export function createSlackTransport(
             blocks.push({
               type: 'task_card',
               task_id: 'task',
-              title: input.title,
+              title: `Overall task: ${input.title}`,
               status,
             });
           }
@@ -1091,14 +1154,26 @@ export function createSlackTransport(
                 },
               ],
             });
+          if (plan && Buffer.byteLength(JSON.stringify({ text, blocks }), 'utf8') > 32 * 1024) {
+            text =
+              'Plan states unknown; reported intent unavailable. Step outcomes are unverified.';
+            blocks = [
+              { type: 'section', text: { type: 'plain_text', text } },
+              ...blocks.filter((block) => block.type === 'actions'),
+            ];
+          }
           const render = async () => {
-            const send = () => {
+            const send = async () => {
+              signal.throwIfAborted();
+              if (input.current && !(await input.current())) return undefined;
               if (previous?.provider_id) {
                 return viewWeb.chat.update({
                   channel: dm,
                   ts: messageId(previous.provider_id),
                   text,
                   blocks,
+                  parse: 'none',
+                  link_names: false,
                 });
               }
               return viewWeb.chat.postMessage({
@@ -1106,6 +1181,9 @@ export function createSlackTransport(
                 thread_ts: root,
                 text,
                 blocks,
+                mrkdwn: false,
+                parse: 'none',
+                link_names: false,
                 unfurl_links: false,
                 unfurl_media: false,
               });
@@ -1113,22 +1191,46 @@ export function createSlackTransport(
             try {
               return await send();
             } catch (error) {
+              const strip = blocks.findIndex((block) => block.type === 'plan');
               const card = blocks.findIndex((block) => block.type === 'task_card');
               if (
                 !(error instanceof WebAPIPlatformError) ||
                 error.data.error !== 'invalid_blocks' ||
-                card < 0
+                'ts' in error.data ||
+                'message' in error.data ||
+                'warning' in error.data ||
+                error.data.response_metadata?.warnings?.length ||
+                (strip < 0 && (nativePlan || card < 0))
               )
                 throw error;
+              if (strip >= 0) {
+                blocks.splice(strip, 1);
+                return send();
+              }
               cardsUnsupported = true;
               cardsError = 'Slack task cards unavailable: invalid_blocks.';
               blocks.splice(card, 1);
               return send();
             }
           };
+          const receipt = (sent: Awaited<ReturnType<typeof render>>) => {
+            if (!sent) return undefined;
+            const warning = sent.warning || sent.response_metadata?.warnings?.[0];
+            if (warning)
+              throw new MessagingConnectionError(
+                `Slack failed: ${/^[a-z_]{1,80}$/.test(warning) ? warning : 'control_response_warning'}.`,
+              );
+            if (
+              !sent.ts ||
+              !timestamp.test(sent.ts) ||
+              (previous?.provider_id && sent.ts !== messageId(previous.provider_id))
+            )
+              throw new MessagingConnectionError('Slack failed: control_receipt_unavailable.');
+            return sent.ts;
+          };
           if (previous?.provider_id) {
             if (input.current && !(await input.current())) return {};
-            await render();
+            if (!receipt(await render())) return {};
             viewError = undefined;
             updateRichError();
             return { id: previous.provider_id };
@@ -1146,9 +1248,15 @@ export function createSlackTransport(
             return {};
           }
           const sent = await render();
-          if (!sent.ts || !timestamp.test(sent.ts))
-            throw new MessagingConnectionError('Slack failed: control_receipt_unavailable.');
-          const providerId = `${dm}:${sent.ts}`;
+          const accepted = receipt(sent);
+          if (!accepted) {
+            await pool.query(
+              "DELETE FROM channel_slack_views WHERE installation=$1 AND session_id=$2 AND root_id=$3 AND state='sending' AND provider_id IS NULL",
+              [key, input.sessionId, input.rootMessageId],
+            );
+            return {};
+          }
+          const providerId = `${dm}:${accepted}`;
           await pool.query(
             "UPDATE channel_slack_views SET state='sent',provider_id=$3 WHERE installation=$1 AND session_id=$2 AND root_id=$4",
             [key, input.sessionId, providerId, input.rootMessageId],

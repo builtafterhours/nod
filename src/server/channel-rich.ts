@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
-import type { MessagingControl, MessagingTransport } from '../ports/messaging.ts';
+import type {
+  MessagingControl,
+  MessagingConversation,
+  MessagingTransport,
+} from '../ports/messaging.ts';
 import { transaction } from './transaction.ts';
 import { logFailure } from './failure-log.ts';
 import { laterSupersedingTurnSql, waitingTurnSql, workOriginSql } from './turn-chain.ts';
@@ -749,6 +753,15 @@ export async function createChannelRich(
         task_state: string | null;
         steps: string[];
         step_index: number;
+        task_id: string;
+        task_turn_id: string;
+        revision: number;
+        applied_revision: number;
+        task_revision: number | null;
+        plan_steps: unknown;
+        plan_revision: number;
+        progress_revision: number;
+        waiting_for: unknown[];
       }
     >(
       `WITH candidates AS MATERIALIZED (
@@ -764,6 +777,8 @@ export async function createChannelRich(
        ) SELECT DISTINCT ON (u.session_id) $1::text AS owner_id,i.account_id,i.sender_id,i.thread_id AS dm,
        u.session_id,u.thread_id,u.id AS turn_id,u.channel,COALESCE(t.message_id,i.message_id) AS target_id,
        COALESCE(t.title,'Nod') AS title,COALESCE(t.now_text,'') AS text,u.status,t.state AS task_state,t.steps,t.step_index,
+       t.id AS task_id,t.turn_id AS task_turn_id,t.revision,t.applied_revision,u.task_revision,
+       t.plan_steps,t.plan_revision,t.progress_revision,t.waiting_for,
        NULL::text AS root_id
        FROM current u JOIN threads th ON th.id=u.thread_id AND th.owner_id=u.owner_id AND th.archived_at IS NULL
        JOIN LATERAL (
@@ -874,24 +889,86 @@ export async function createChannelRich(
         );
         const safe = options.safe(row.text);
         const text = safe.secureAction || safe.artifact ? '' : safe.text.slice(0, 1000);
-        const task = row.task_state
+        const metadata = z
+          .object({
+            planRevision: z.number().int().nonnegative().max(2147483647),
+            progressRevision: z.number().int().nonnegative().max(2147483647),
+            steps: z
+              .array(
+                z
+                  .object({
+                    id: z.uuid(),
+                    title: z
+                      .string()
+                      .min(1)
+                      .refine((title) => title.length <= 200 && title === title.trim()),
+                    state: z.enum(['pending', 'started']),
+                  })
+                  .strict(),
+              )
+              .max(50),
+          })
+          .safeParse({
+            planRevision: row.plan_revision,
+            progressRevision: row.progress_revision,
+            steps: row.plan_steps,
+          });
+        const structured =
+          metadata.success &&
+          metadata.data.steps.length === row.steps?.length &&
+          new Set(metadata.data.steps.map((step) => step.id)).size === metadata.data.steps.length &&
+          metadata.data.steps.every((step, index) => step.title === row.steps[index]);
+        const task: MessagingConversation['task'] = row.task_state
           ? {
               state: row.task_state,
-              steps: (row.steps ?? [])
+              steps: (row.plan_steps === null &&
+              row.plan_revision === 0 &&
+              row.progress_revision === 0
+                ? (row.steps ?? [])
+                : []
+              )
                 .slice(0, 50)
                 .map((step) => options.safe(step).text.slice(0, 200)),
               stepIndex: row.step_index ?? 0,
+              plan: structured
+                ? {
+                    kind: 'structured',
+                    planRevision: metadata.data.planRevision,
+                    progressRevision: metadata.data.progressRevision,
+                    activity:
+                      row.status === 'running' &&
+                      row.task_state === 'open' &&
+                      row.task_turn_id === row.turn_id &&
+                      row.revision === row.applied_revision &&
+                      row.task_revision === row.revision &&
+                      row.waiting_for.length === 0
+                        ? 'current'
+                        : 'historical',
+                    steps: metadata.data.steps.map((step, index) => ({
+                      key: `p${row.plan_revision}_s${index + 1}`,
+                      ordinal: index + 1,
+                      intent: step.state,
+                    })),
+                  }
+                : { kind: 'legacy', state: 'unknown' },
             }
           : undefined;
+        const generation = revision;
         const signature = JSON.stringify([
           row.turn_id,
           status,
           text,
           nonce,
           task,
+          row.revision,
+          row.applied_revision,
+          row.task_revision,
+          row.plan_revision,
+          row.progress_revision,
           status === 'processing' ? Math.floor(Date.now() / (45 * 60_000)) : 0,
         ]);
         if (shown.get(row.session_id) === signature && existing?.last_status === status) continue;
+        let isCurrent: (() => Promise<boolean>) | undefined;
         const view = await options.transport().conversation?.({
           ownerId: row.owner_id,
           channelId: 'slack',
@@ -913,21 +990,54 @@ export async function createChannelRich(
           task,
           outcome: row.status === 'failed' || row.status === 'cancelled' ? row.status : undefined,
           signal,
-          current: async () => {
-            if (closed || signal.aborted || !permitted(row)) return false;
+          current: (isCurrent = async () => {
+            if (closed || signal.aborted || !permitted(row) || !rich() || revision !== generation)
+              return false;
             const current = await pool.query(
-              `SELECT 1 FROM channel_roots r WHERE r.owner_id=$1 AND r.session_id=$2 AND r.turn_id=$3 AND r.root_id=$4
+              `SELECT 1 FROM channel_roots r JOIN tasks t ON t.owner_id=r.owner_id AND t.session_id=r.session_id
+               JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
+               JOIN threads th ON th.id=r.thread_id AND th.owner_id=r.owner_id AND th.archived_at IS NULL
+               WHERE r.owner_id=$1 AND r.session_id=$2 AND r.turn_id=$3 AND r.root_id=$4 AND r.state='open'
+               AND r.lifecycle_revision=$5 AND r.account_id=$6 AND r.sender_id=$7 AND r.dm=$8 AND r.thread_id=$9
+               AND t.id=$10 AND t.turn_id=$11 AND t.revision=$12 AND t.applied_revision=$13
+               AND t.plan_revision=$14 AND t.progress_revision=$15 AND t.state=$16 AND u.status=$17
+               AND u.task_revision IS NOT DISTINCT FROM $18::integer AND t.waiting_for=$19::jsonb
+               AND r.nonce IS NOT DISTINCT FROM $20::uuid AND r.status_nonce IS NOT DISTINCT FROM $21::uuid
+               AND (r.nonce IS NULL OR r.expires_at>now())
                AND r.turn_id=COALESCE(
                  (SELECT live.id FROM turns live WHERE live.owner_id=r.owner_id AND live.session_id=r.session_id AND live.status='running' ORDER BY live.created_at DESC,live.id DESC LIMIT 1),
                  (SELECT latest.id FROM turns latest WHERE latest.owner_id=r.owner_id AND latest.session_id=r.session_id ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1))`,
-              [options.ownerId, row.session_id, row.turn_id, row.root_id],
+              [
+                options.ownerId,
+                row.session_id,
+                row.turn_id,
+                row.root_id,
+                existing?.lifecycle_revision ?? '0',
+                row.account_id,
+                row.sender_id,
+                row.dm,
+                row.thread_id,
+                row.task_id,
+                row.task_turn_id,
+                row.revision,
+                row.applied_revision,
+                row.plan_revision,
+                row.progress_revision,
+                row.task_state,
+                row.status,
+                row.task_revision,
+                JSON.stringify(row.waiting_for),
+                nonce,
+                binding.rows[0]?.status_nonce ?? null,
+              ],
             );
             return (
               Boolean(current.rowCount) &&
               (await desiredStatus({ ...row, thread_id: row.dm }, row.root_id!)) === status
             );
-          },
+          }),
         });
+        if (!view?.id || !(await isCurrent?.())) continue;
         if (view?.id && !signal.aborted)
           await pool.query(
             'UPDATE channel_roots SET control_message_id=$3 WHERE owner_id=$1 AND session_id=$2 AND turn_id=$4 AND dm=$5',
@@ -935,8 +1045,36 @@ export async function createChannelRich(
           );
         if (!signal.aborted) {
           const saved = await pool.query(
-            'UPDATE channel_roots SET last_status=$4 WHERE owner_id=$1 AND session_id=$2 AND dm=$3 AND lifecycle_revision=$5',
-            [options.ownerId, row.session_id, row.dm, status, existing?.lifecycle_revision ?? '0'],
+            `UPDATE channel_roots r SET last_status=$4 WHERE r.owner_id=$1 AND r.session_id=$2 AND r.dm=$3 AND r.lifecycle_revision=$5
+             AND r.turn_id=$6 AND r.root_id=$7 AND r.state='open'
+             AND EXISTS(SELECT 1 FROM tasks t JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
+               WHERE t.owner_id=r.owner_id AND t.session_id=r.session_id AND t.id=$8 AND t.turn_id=$9
+               AND t.revision=$10 AND t.applied_revision=$11 AND t.plan_revision=$12 AND t.progress_revision=$13
+               AND t.state=$14 AND u.status=$15 AND u.task_revision IS NOT DISTINCT FROM $16::integer
+               AND t.waiting_for=$17::jsonb)
+             AND r.nonce IS NOT DISTINCT FROM $18::uuid AND r.status_nonce IS NOT DISTINCT FROM $19::uuid
+             AND (r.nonce IS NULL OR r.expires_at>now())`,
+            [
+              options.ownerId,
+              row.session_id,
+              row.dm,
+              status,
+              existing?.lifecycle_revision ?? '0',
+              row.turn_id,
+              row.root_id,
+              row.task_id,
+              row.task_turn_id,
+              row.revision,
+              row.applied_revision,
+              row.plan_revision,
+              row.progress_revision,
+              row.task_state,
+              row.status,
+              row.task_revision,
+              JSON.stringify(row.waiting_for),
+              nonce,
+              binding.rows[0]?.status_nonce ?? null,
+            ],
           );
           if (saved.rowCount) shown.set(row.session_id, signature);
         }

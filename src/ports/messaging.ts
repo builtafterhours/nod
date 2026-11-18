@@ -91,7 +91,20 @@ export interface MessagingConversation {
   title: string;
   text: string;
   control?: { stop: string; status: string };
-  task?: { state: string; steps: string[]; stepIndex: number };
+  task?: {
+    state: string;
+    steps: string[];
+    stepIndex: number;
+    plan?:
+      | { kind: 'legacy'; state: 'unknown' }
+      | {
+          kind: 'structured';
+          planRevision: number;
+          progressRevision: number;
+          activity: 'current' | 'historical';
+          steps: ReadonlyArray<{ key: string; ordinal: number; intent: 'pending' | 'started' }>;
+        };
+  };
   outcome?: 'failed' | 'cancelled';
   signal: AbortSignal;
   current?(): Promise<boolean>;
