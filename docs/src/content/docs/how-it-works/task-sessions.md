@@ -55,6 +55,18 @@ Each turn sees up to 100 tasks of the active conversation, open ones first, then
 
 A model-written task list in the workspace does not replace the ledger. The existing turn queue runs the sessions. The task system does not add another scheduler or cost ledger.
 
+### Plan intent and progress
+
+Tasks can optionally store a structured plan with up to 50 titles, each at most 200 UTF-16 code units after trimming. An astral character uses two units. Titles are rejected above the limit, never truncated. The server assigns opaque step IDs. New steps start as `pending`; the task can explicitly mark a named step `started`. These states record intent, not verified outcomes. There are no completed or failed step states.
+
+The task's `plan` snapshot distinguishes structured plans from legacy strings, whose state is `unknown`. Legacy `stepIndex` is only a focus hint. Neither advancing it nor finishing, waiting, failing, or settling a task completes any step. Older oversized plans remain readable without truncation or inferred state.
+
+Structured snapshots bind the owner, task, and session, with separate `planRevision` and `progressRevision` values. These do not change the owner-instruction `revision` and `appliedRevision`. A structured write requires both expected plan revisions, the current task turn, and the current applied owner instruction. Stop and the normal turn lock still fence writes. Stale, conflicting, or duplicate progress writes fail without mutation or automatic retry.
+
+A changed or reordered replacement assigns all new step IDs and resets intent to pending. It advances both plan and progress revisions. An identical replacement can leave both unchanged. Starting a step advances only the progress revision. Titles and structured metadata save atomically. Legacy steps cannot overwrite structured state; callers must read the task and use a versioned replacement.
+
+This is an internal foundation. Channel views still use the existing titles and focus hint; they do not receive structured step state or native plan updates.
+
 ## Start, reply and finish
 
 1. The owner gives the coordinator an independent goal. The coordinator uses `task start` with a title, completion condition, brief and planned steps.
