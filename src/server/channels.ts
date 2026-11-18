@@ -317,10 +317,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   const hasApprovals =
     (await pool.query("SELECT to_regclass('approvals') IS NOT NULL AS present")).rows[0]
       ?.present === true;
-  const slackQuestionFence = hasApprovals
-    ? `AND (i.provider<>'slack' OR (o.state='sent' AND NOT o.streamed) OR NOT EXISTS (
+  const slackQuestionFence =
+    `AND (i.provider<>'slack' OR NOT o.delivery_only) ` +
+    (hasApprovals
+      ? `AND (i.provider<>'slack' OR (o.state='sent' AND NOT o.streamed) OR NOT EXISTS (
     SELECT 1 FROM approvals a WHERE a.owner_id=m.owner_id AND a.confirmation_message_id=m.id))`
-    : '';
+      : '');
   let sendFencePool: Pool | undefined;
   const fencePool = () => {
     if (!sendFencePool) {
@@ -389,6 +391,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS claim_id uuid;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS live_status text;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS streamed boolean NOT NULL DEFAULT false;
+  ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS delivery_only boolean NOT NULL DEFAULT false;
   CREATE INDEX IF NOT EXISTS channel_inbox_pending ON channel_inbox(state,created_at);
   CREATE INDEX IF NOT EXISTS channel_outbox_pending ON channel_outbox(state,created_at);
   CREATE INDEX IF NOT EXISTS channel_inbox_turn ON channel_inbox(turn_id);
@@ -1056,7 +1059,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             await pool.query(
               `SELECT 1 FROM approvals a JOIN channel_outbox o ON o.message_id=a.confirmation_message_id
          JOIN channel_inbox i ON i.source_id=o.source_id WHERE a.owner_id=$1 AND a.confirmation_message_id=$2 AND a.status='pending'
-         AND o.state='sent' AND NOT o.streamed AND i.owner_id=$1 AND i.provider='slack' AND i.account_id=$3 AND i.sender_id=$4`,
+         AND o.state='sent' AND NOT o.streamed AND NOT o.delivery_only AND i.owner_id=$1 AND i.provider='slack' AND i.account_id=$3 AND i.sender_id=$4`,
               [ownerId, replyToMessageId, pending.account_id, pending.sender_id],
             )
           ).rowCount
@@ -1081,7 +1084,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       ) {
         const threadId = options.activeThread ? (await options.activeThread(client)).id : null;
         await saveReply(client, row.source_id, threadId, {
-          text: 'That Slack thread is no longer available. Send a new direct message, or reply to a current Nod message.',
+          text: 'Nod cannot safely route that Slack reply. Send a new direct message, or reply to a current, fully delivered Nod message.',
         });
         await client.query(
           "UPDATE channel_inbox SET state='discarded' WHERE source_id=$1 AND owner_id=$2",
@@ -1204,20 +1207,24 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
 
   async function enqueueOutbox() {
     await pool.query(
-      `INSERT INTO channel_outbox(message_id,source_id)
-      SELECT DISTINCT ON (m.id) m.id,i.source_id FROM messages m
+      `INSERT INTO channel_outbox(message_id,source_id,delivery_only)
+      SELECT DISTINCT ON (m.id) m.id,i.source_id,
+        i.provider='slack' AND u.channel_source_id IS NULL AND exact.source_id IS NULL FROM messages m
       JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id
+      LEFT JOIN LATERAL (
+        WITH RECURSIVE lineage(id,parent_turn_id,depth) AS (
+          SELECT u.id,(to_jsonb(u)->>'parent_turn_id')::uuid,0 WHERE u.channel_source_id IS NULL AND starts_with(u.channel,'slack:')
+          UNION ALL SELECT p.id,(to_jsonb(p)->>'parent_turn_id')::uuid,c.depth+1 FROM lineage c JOIN turns p ON p.id=c.parent_turn_id
+            AND p.owner_id=u.owner_id AND p.thread_id=u.thread_id AND p.channel=u.channel WHERE c.depth<200)
+        SELECT receipt.source_id FROM lineage c JOIN channel_inbox receipt ON receipt.turn_id=c.id
+          AND receipt.owner_id=u.owner_id AND receipt.channel=u.channel AND receipt.state='submitted'
+        ORDER BY c.depth LIMIT 1
+      ) exact ON true
       JOIN channel_inbox i ON i.channel=u.channel AND i.owner_id=m.owner_id AND i.created_at<=m.created_at
         AND (u.channel_source_id IS NULL OR i.source_id=u.channel_source_id)
-        AND (i.provider<>'slack' OR u.channel_source_id IS NOT NULL OR EXISTS (
-          WITH RECURSIVE lineage(id,parent_turn_id,depth) AS (
-            SELECT u.id,(to_jsonb(u)->>'parent_turn_id')::uuid,0
-            UNION ALL SELECT p.id,(to_jsonb(p)->>'parent_turn_id')::uuid,c.depth+1 FROM lineage c JOIN turns p ON p.id=c.parent_turn_id
-              AND p.owner_id=u.owner_id AND p.thread_id=u.thread_id AND p.channel=u.channel WHERE c.depth<200)
-          SELECT 1 FROM lineage WHERE id=i.turn_id))
       WHERE m.role='assistant' AND m.owner_id=$1 AND m.hidden_at IS NULL AND i.state='submitted' AND u.channel<>'web'
         AND NOT EXISTS (SELECT 1 FROM channel_outbox q WHERE q.message_id=m.id)
-      ORDER BY m.id,(i.turn_id IS NOT DISTINCT FROM m.turn_id) DESC,i.received_at DESC,i.source_id
+      ORDER BY m.id,(i.source_id IS NOT DISTINCT FROM exact.source_id) DESC,(i.turn_id IS NOT DISTINCT FROM m.turn_id) DESC,i.received_at DESC,i.source_id
       ON CONFLICT(message_id) DO NOTHING`,
       [ownerId],
     );
@@ -1494,12 +1501,16 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                 [row.message_id, ownerId],
               )
             ).rows[0];
-            if (context && !context.approval) await rich.prepare(context.session_id);
-            const root = context ? await rich.root(row, context.session_id) : undefined;
+            if (context && !context.approval)
+              await rich.prepare(context.session_id, context.turn_id);
+            const root = context
+              ? await rich.root(row, context.session_id, context.turn_id)
+              : undefined;
             const safe = channelText(row.text);
             const stream =
               context &&
               root?.root_id &&
+              root.turn_id === context.turn_id &&
               !context.approval &&
               !safe.secureAction &&
               !safe.artifact &&
