@@ -4402,7 +4402,9 @@ test('Slack reports a partly sent reply as uncertain with its delivered message 
     slack.responses.set('chat.postMessage', [
       undefined,
       async () => {
-        throw new TypeError('fetch failed');
+        throw new TypeError('fetch failed', {
+          cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+        });
       },
     ]);
     const text = Array.from(
@@ -4416,7 +4418,7 @@ test('Slack reports a partly sent reply as uncertain with its delivered message 
         (error: unknown) => error,
       );
     assert.ok(failure instanceof MessagingDeliveryError);
-    assert.equal(failure.message, 'Slack failed: network_request_failed.');
+    assert.equal(failure.message, 'Slack failed: network_request_failed (ECONNRESET).');
     assert.deepEqual(failure.ids, ['DOWNER:1700000100.000001']);
     const posts = slack.calls.filter((call) => call.method === 'chat.postMessage');
     assert.equal(posts.length, 2);
