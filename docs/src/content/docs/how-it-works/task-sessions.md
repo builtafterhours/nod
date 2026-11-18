@@ -57,11 +57,11 @@ A model-written task list in the workspace does not replace the ledger. The exis
 
 ### Plan intent and progress
 
-Tasks can optionally store a structured plan with up to 50 titles, each at most 200 UTF-16 code units after trimming. An astral character uses two units. Titles are rejected above the limit, never truncated. The server assigns opaque step IDs. New steps start as `pending`; the task can explicitly mark a named step `started`. These states record intent, not verified outcomes. There are no completed or failed step states.
+Tasks can optionally store a structured plan with up to 50 titles, each at most 200 raw UTF-16 code units before trimming. An astral character uses two units. Inputs above the limit are rejected, never truncated. Accepted titles are trimmed and must not be empty. The server assigns opaque step IDs. New steps start as `pending`; the task can explicitly mark a named step `started`. These states record intent, not verified outcomes. There are no completed or failed step states.
 
 The task's `plan` snapshot distinguishes structured plans from legacy strings, whose state is `unknown`. Legacy `stepIndex` is only a focus hint. Neither advancing it nor finishing, waiting, failing, or settling a task completes any step. Older oversized plans remain readable without truncation or inferred state.
 
-Structured snapshots bind the owner, task, and session, with separate `planRevision` and `progressRevision` values. These do not change the owner-instruction `revision` and `appliedRevision`. A structured write requires both expected plan revisions, the current task turn, and the current applied owner instruction. Stop and the normal turn lock still fence writes. Stale, conflicting, or duplicate progress writes fail without mutation or automatic retry.
+The server checks owner and session bindings internally. Public plan snapshots expose only the task ID, step IDs, titles, states, and separate `planRevision` and `progressRevision` values. These do not change the owner-instruction `revision` and `appliedRevision`. A structured write requires both expected plan revisions, the current task turn, and the current applied owner instruction. Stop and the normal turn lock still fence writes. Stale, conflicting, or duplicate progress writes fail without mutation or automatic retry.
 
 A changed or reordered replacement assigns all new step IDs and resets intent to pending. It advances both plan and progress revisions. An identical replacement can leave both unchanged. Starting a step advances only the progress revision. Titles and structured metadata save atomically. Legacy steps cannot overwrite structured state; callers must read the task and use a versioned replacement.
 

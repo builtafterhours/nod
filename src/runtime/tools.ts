@@ -166,7 +166,15 @@ const scheduleObservation = Type.Union([
 ]);
 
 const taskNow = Type.String({ minLength: 1 });
-const taskPlanSteps = Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 50 });
+const taskPlanSteps = Type.Array(
+  Type.String({
+    minLength: 1,
+    maxLength: 200,
+    description:
+      'At most 200 raw UTF-16 code units before trimming; accepted titles are trimmed and must not be empty.',
+  }),
+  { maxItems: 50 },
+);
 const taskPlanVersions = {
   expectedPlanRevision: Type.Integer({ minimum: 0 }),
   expectedProgressRevision: Type.Integer({ minimum: 0 }),
