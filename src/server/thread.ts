@@ -1850,9 +1850,9 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
     ...work,
     ...(dependencies.taskClassification ? { task_taxonomy_version: 1 as const } : {}),
     source: turn.source as TurnSource,
-    channel: (['web', 'telegram', 'whatsapp'].includes(providerChannel)
+    channel: (['web', 'telegram', 'whatsapp', 'slack'].includes(providerChannel)
       ? providerChannel
-      : 'other') as 'web' | 'telegram' | 'whatsapp' | 'other',
+      : 'other') as 'web' | 'telegram' | 'whatsapp' | 'slack' | 'other',
     background: Boolean(turn.background),
     ...model,
   };
