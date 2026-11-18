@@ -269,7 +269,7 @@ Nod saves the WhatsApp device keys encrypted in its database. The keys stay on t
 
 After a restart or network loss, Nod uses the saved link to connect again. Replies that have not started sending wait while WhatsApp is disconnected. A send with an unclear result is not repeated automatically. This prevents duplicate messages; check Nod if a reply does not arrive.
 
-If messages stop, open **Channels** and select **Reconnect** for Telegram or WhatsApp. Nod restarts message delivery with the saved settings. It keeps your paired Telegram account and saved WhatsApp device keys. A saved Telegram webhook is registered again. Telegram polling errors show the service's status and reason on this page.
+If messages stop, open **Channels** and select **Reconnect** for Telegram, WhatsApp or Slack. Nod restarts message delivery with the saved settings. It keeps your paired Telegram account and saved WhatsApp device keys. A saved Telegram webhook is registered again. Telegram polling errors show the service's status and reason on this page.
 
 **Reconnect** also works for server-managed channels. Their settings still come from the server environment. For WhatsApp, the connection panel opens after reconnecting. If WhatsApp has signed out the device, select **Start again** and scan a new code.
 
@@ -279,12 +279,12 @@ The Channels page checks status every five seconds while visible. During Telegra
 
 ## Private steps happen in the Nod app
 
-Passwords, saved logins, app sign-ins and payment approvals never go through a chat app. When a task started on Telegram or WhatsApp needs one, Nod asks you to open Nod. Finish the step there, and the task carries on and replies in the chat app.
+Passwords, saved logins, app sign-ins and payment approvals never go through a chat app. When a task started in a chat app needs one, Nod asks you to open Nod. Finish the step there, and the task carries on and replies in the chat app.
 
 ```mermaid
 sequenceDiagram
   actor You
-  participant Chat as Telegram or WhatsApp
+  participant Chat as Chat app
   participant App as Nod app
   participant Nod
   You->>Chat: Book the table with my saved login

@@ -36,7 +36,7 @@ This page explains the words you'll meet in these docs. Select a term to read th
 | [Connected app](/connect/apps/)      | An account Nod can use for you, such as Gmail, Calendar or Slack.                                                                                            |
 | [Composio](/connect/apps/)           | The service Nod uses to connect many apps for you. You sign in to each app and choose what it can access.                                                    |
 | [MCP](/connect/mcp-api-cli/)         | Model Context Protocol, a standard way for an app to offer tools to an assistant. Notion, Linear and n8n connect through their own MCP servers.              |
-| [Channel](/use/channels/)            | Another place to chat with Nod besides the app: Telegram or WhatsApp.                                                                                        |
+| [Channel](/use/channels/)            | Another place to chat with Nod besides the app: Telegram, WhatsApp or Slack.                                                                                 |
 
 ## Safety and control
 
