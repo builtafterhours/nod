@@ -30,6 +30,7 @@ export interface MessagingChannel {
   presenceMs?: number;
   rich?: boolean;
   richError?: string;
+  installationId?: string;
 }
 
 export interface MessagingAttachment {
@@ -50,6 +51,8 @@ export interface InboundMessage {
   text: string;
   attachments?: MessagingAttachment[];
   replyToMessageId?: string;
+  conversationRootMessageId?: string;
+  installationId?: string;
   sentAt: Date;
 }
 
@@ -73,6 +76,7 @@ export interface MessagingControl {
   nonce?: string;
   messageId?: string;
   streamIds?: string[];
+  installationId?: string;
 }
 
 export interface MessagingConversation {
@@ -90,6 +94,7 @@ export interface MessagingConversation {
   task?: { state: string; steps: string[]; stepIndex: number };
   outcome?: 'failed' | 'cancelled';
   signal: AbortSignal;
+  current?(): Promise<boolean>;
 }
 
 export interface ChannelPairingRequest {
@@ -146,6 +151,7 @@ export interface MessagingTransport {
     rootMessageId?: string;
     deliveryId?: string;
     stream?: {
+      status?(): Promise<MessagingConversation['status']>;
       record(input: {
         part: number;
         state:

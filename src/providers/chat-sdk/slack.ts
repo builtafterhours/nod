@@ -504,6 +504,18 @@ export function createSlackTransport(
         `${channel.accountId}:${parsed.success ? parsed.data.allowedUserId : ''}:${verified?.appId}`,
       )
       .digest('hex');
+  const conversations = new Map<string, Promise<unknown>>();
+  function serialize<T>(root: string, work: () => Promise<T>): Promise<T> {
+    const previous = conversations.get(root) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(work);
+    conversations.set(root, next);
+    void next
+      .finally(() => {
+        if (conversations.get(root) === next) conversations.delete(root);
+      })
+      .catch(() => {});
+    return next;
+  }
 
   async function control(type: string, body: unknown, ack: () => Promise<void>) {
     if (!channel.rich || !acceptControl || closed || !verified || !parsed.success) return;
@@ -534,6 +546,7 @@ export function createSlackTransport(
         rootMessageId: `${verified.dmId}:${basic.data.event.thread_ts}`,
         action: 'stop',
         streamIds: ids,
+        installationId: installation(),
       };
     }
     if (type === 'interactive') {
@@ -580,6 +593,7 @@ export function createSlackTransport(
             action: selected.action_id === 'nod_stop' ? 'stop' : 'status',
             nonce: selected.value,
             messageId: message,
+            installationId: installation(),
           };
       }
     }
@@ -762,6 +776,7 @@ export function createSlackTransport(
           });
           await connect(candidate, AbortSignal.any([lifetime.signal, AbortSignal.timeout(20_000)]));
           if (current() && !replacementNeeded && !terminal && verified === checked) {
+            channel.installationId = installation();
             channel.available = true;
             channel.error = undefined;
             attempts = 0;
@@ -849,12 +864,14 @@ export function createSlackTransport(
         claimedParts.push(part);
         let started;
         try {
-          await pace('start', signal);
-          await input.stream.record({ part, state: 'dispatching' });
-          started = await streamWeb.chat.startStream({
-            channel: dm,
-            thread_ts: root,
-            chunks: [{ type: 'markdown_text', text: streamFragments(text, 3000)[0] }],
+          started = await serialize(input.rootMessageId, async () => {
+            await pace('start', signal);
+            await input.stream!.record({ part, state: 'dispatching' });
+            return streamWeb.chat.startStream({
+              channel: dm,
+              thread_ts: root,
+              chunks: [{ type: 'markdown_text', text: streamFragments(text, 3000)[0] }],
+            });
           });
         } catch (error) {
           if (
@@ -947,11 +964,15 @@ export function createSlackTransport(
         await pace('stop', signal);
         await input.stream.record({ part, state: 'finalizing' });
         stoppingStream = true;
-        const stopped = await streamWeb.chat.stopStream({
-          channel: dm,
-          ts: started.ts,
-          session_status: part < parts.length - 1 ? 'processing' : 'active',
-        });
+        const stopped = await serialize(input.rootMessageId, async () =>
+          streamWeb.chat.stopStream({
+            channel: dm,
+            ts: started.ts!,
+            session_status:
+              (await input.stream!.status?.()) ??
+              (part < parts.length - 1 ? 'processing' : 'active'),
+          }),
+        );
         openStreamId = undefined;
         warning(stopped);
         await input.stream.record({ part, state: 'finalized', id: providerId, confirmedChars });
@@ -971,9 +992,13 @@ export function createSlackTransport(
           parsed.success ? parsed.data.botToken : '',
           AbortSignal.any([lifetime.signal, AbortSignal.timeout(3000)]),
         );
-        await cleanup.chat
-          .stopStream({ channel: dm, ts: messageId(openStreamId), session_status: 'active' })
-          .catch(() => {});
+        await serialize(input.rootMessageId, async () =>
+          cleanup.chat.stopStream({
+            channel: dm,
+            ts: messageId(openStreamId!),
+            session_status: (await input.stream!.status?.()) ?? 'active',
+          }),
+        ).catch(() => {});
       }
       if (!signal.aborted) {
         streamError = failure(error).message;
@@ -992,171 +1017,182 @@ export function createSlackTransport(
       };
     },
     async conversation(input) {
-      try {
-        if (!channel.rich) return {};
-        const dm = target(input);
-        const root = messageId(input.rootMessageId);
-        const signal = AbortSignal.any([lifetime.signal, input.signal]);
-        signal.throwIfAborted();
-        const viewWeb = client(parsed.success ? parsed.data.botToken : '', signal);
-        const wait = Math.max(0, nextViewAt - Date.now());
-        nextViewAt = Date.now() + wait + 1300;
-        if (wait) await delay(wait, undefined, { signal });
-        await richTable();
-        if (!statusUnsupported) {
-          try {
-            const status = await viewWeb.agents.sessions.setStatus({
-              channel_id: dm,
-              thread_ts: root,
-              status: input.status,
-              title: input.title,
-              initiator_user_id: parsed.success ? parsed.data.allowedUserId : undefined,
-            });
-            nativeStopError =
-              status.warning === 'missing_agent_session_stopped_event_subscription'
-                ? 'Slack native Stop is unavailable: missing_agent_session_stopped_event_subscription.'
-                : undefined;
-          } catch (error) {
-            if (
-              error instanceof WebAPIPlatformError &&
-              ['missing_scope', 'feature_disabled'].includes(error.data.error)
-            ) {
-              statusUnsupported = true;
-              statusError = `Native status unavailable. ${failure(error).message}`;
-            } else throw failure(error);
+      return serialize(input.rootMessageId, async () => {
+        try {
+          if (!channel.rich) return {};
+          const dm = target(input);
+          const root = messageId(input.rootMessageId);
+          const signal = AbortSignal.any([lifetime.signal, input.signal]);
+          signal.throwIfAborted();
+          const viewWeb = client(parsed.success ? parsed.data.botToken : '', signal);
+          const wait = Math.max(0, nextViewAt - Date.now());
+          nextViewAt = Date.now() + wait + 1300;
+          if (wait) await delay(wait, undefined, { signal });
+          if (input.current && !(await input.current())) return {};
+          await richTable();
+          if (!statusUnsupported) {
+            try {
+              const status = await viewWeb.agents.sessions.setStatus({
+                channel_id: dm,
+                thread_ts: root,
+                status: input.status,
+                title: input.title,
+                initiator_user_id: parsed.success ? parsed.data.allowedUserId : undefined,
+              });
+              nativeStopError =
+                status.warning === 'missing_agent_session_stopped_event_subscription'
+                  ? 'Slack native Stop is unavailable: missing_agent_session_stopped_event_subscription.'
+                  : undefined;
+            } catch (error) {
+              if (
+                error instanceof WebAPIPlatformError &&
+                ['missing_scope', 'feature_disabled'].includes(error.data.error)
+              ) {
+                statusUnsupported = true;
+                statusError = `Native status unavailable. ${failure(error).message}`;
+              } else throw failure(error);
+            }
           }
-        }
-        const key = installation();
-        const previous = (
-          await pool.query<{ provider_id: string | null; state: string }>(
-            'SELECT provider_id,state FROM channel_slack_views WHERE installation=$1 AND session_id=$2 AND root_id=$3',
-            [key, input.sessionId, input.rootMessageId],
-          )
-        ).rows[0];
-        if (previous && previous.state !== 'sent') {
-          viewError = 'Slack controls unavailable: previous control delivery is uncertain.';
-          updateRichError();
-          return {};
-        }
-        const text = [
-          input.title,
-          input.outcome === 'failed'
-            ? 'Failed'
-            : input.outcome === 'cancelled'
-              ? 'Stopped'
-              : input.status === 'processing'
-                ? 'Working'
-                : input.status === 'suspended'
-                  ? 'Needs you'
-                  : input.status === 'closed'
-                    ? 'Closed'
-                    : 'Ready',
-          input.text,
-          ...(input.task?.steps ?? []).map((title, index) => `${index + 1}. ${title}`),
-        ]
-          .filter(Boolean)
-          .join('\n');
-        const blocks: NonNullable<ChatStopStreamArguments['blocks']> = [
-          { type: 'section', text: { type: 'plain_text', text: text.slice(0, 2900) } },
-        ];
-        if (input.task && !cardsUnsupported) {
-          const status = input.outcome
-            ? 'error'
-            : input.task.state === 'done'
-              ? 'complete'
-              : input.task.state === 'open'
-                ? 'in_progress'
-                : 'error';
-          blocks.push({
-            type: 'task_card',
-            task_id: 'task',
-            title: input.title,
-            status,
-          });
-        }
-        if (input.control)
-          blocks.push({
-            type: 'actions',
-            elements: [
-              {
-                type: 'button',
-                text: { type: 'plain_text', text: 'Stop' },
-                action_id: 'nod_stop',
-                value: input.control.stop,
-              },
-              {
-                type: 'button',
-                text: { type: 'plain_text', text: 'Status' },
-                action_id: 'nod_status',
-                value: input.control.status,
-              },
-            ],
-          });
-        const render = async () => {
-          const send = () => {
-            if (previous?.provider_id) {
-              return viewWeb.chat.update({
+          const key = installation();
+          const previous = (
+            await pool.query<{ provider_id: string | null; state: string }>(
+              'SELECT provider_id,state FROM channel_slack_views WHERE installation=$1 AND session_id=$2 AND root_id=$3',
+              [key, input.sessionId, input.rootMessageId],
+            )
+          ).rows[0];
+          if (previous && previous.state !== 'sent') {
+            viewError = 'Slack controls unavailable: previous control delivery is uncertain.';
+            updateRichError();
+            return {};
+          }
+          const text = [
+            input.title,
+            input.outcome === 'failed'
+              ? 'Failed'
+              : input.outcome === 'cancelled'
+                ? 'Stopped'
+                : input.status === 'processing'
+                  ? 'Working'
+                  : input.status === 'suspended'
+                    ? 'Needs you'
+                    : input.status === 'closed'
+                      ? 'Closed'
+                      : 'Ready',
+            input.text,
+            ...(input.task?.steps ?? []).map((title, index) => `${index + 1}. ${title}`),
+          ]
+            .filter(Boolean)
+            .join('\n');
+          const blocks: NonNullable<ChatStopStreamArguments['blocks']> = [
+            { type: 'section', text: { type: 'plain_text', text: text.slice(0, 2900) } },
+          ];
+          if (input.task && !cardsUnsupported) {
+            const status = input.outcome
+              ? 'error'
+              : input.task.state === 'done'
+                ? 'complete'
+                : input.task.state === 'open'
+                  ? 'in_progress'
+                  : 'error';
+            blocks.push({
+              type: 'task_card',
+              task_id: 'task',
+              title: input.title,
+              status,
+            });
+          }
+          if (input.control)
+            blocks.push({
+              type: 'actions',
+              elements: [
+                {
+                  type: 'button',
+                  text: { type: 'plain_text', text: 'Stop' },
+                  action_id: 'nod_stop',
+                  value: input.control.stop,
+                },
+                {
+                  type: 'button',
+                  text: { type: 'plain_text', text: 'Status' },
+                  action_id: 'nod_status',
+                  value: input.control.status,
+                },
+              ],
+            });
+          const render = async () => {
+            const send = () => {
+              if (previous?.provider_id) {
+                return viewWeb.chat.update({
+                  channel: dm,
+                  ts: messageId(previous.provider_id),
+                  text,
+                  blocks,
+                });
+              }
+              return viewWeb.chat.postMessage({
                 channel: dm,
-                ts: messageId(previous.provider_id),
+                thread_ts: root,
                 text,
                 blocks,
+                unfurl_links: false,
+                unfurl_media: false,
               });
+            };
+            try {
+              return await send();
+            } catch (error) {
+              const card = blocks.findIndex((block) => block.type === 'task_card');
+              if (
+                !(error instanceof WebAPIPlatformError) ||
+                error.data.error !== 'invalid_blocks' ||
+                card < 0
+              )
+                throw error;
+              cardsUnsupported = true;
+              cardsError = 'Slack task cards unavailable: invalid_blocks.';
+              blocks.splice(card, 1);
+              return send();
             }
-            return viewWeb.chat.postMessage({
-              channel: dm,
-              thread_ts: root,
-              text,
-              blocks,
-              unfurl_links: false,
-              unfurl_media: false,
-            });
           };
-          try {
-            return await send();
-          } catch (error) {
-            const card = blocks.findIndex((block) => block.type === 'task_card');
-            if (
-              !(error instanceof WebAPIPlatformError) ||
-              error.data.error !== 'invalid_blocks' ||
-              card < 0
-            )
-              throw error;
-            cardsUnsupported = true;
-            cardsError = 'Slack task cards unavailable: invalid_blocks.';
-            blocks.splice(card, 1);
-            return send();
+          if (previous?.provider_id) {
+            if (input.current && !(await input.current())) return {};
+            await render();
+            viewError = undefined;
+            updateRichError();
+            return { id: previous.provider_id };
           }
-        };
-        if (previous?.provider_id) {
-          await render();
+          const claim = await pool.query(
+            "INSERT INTO channel_slack_views(installation,session_id,root_id,state) VALUES($1,$2,$3,'sending') ON CONFLICT DO NOTHING RETURNING session_id",
+            [key, input.sessionId, input.rootMessageId],
+          );
+          if (!claim.rowCount) return {};
+          if (input.current && !(await input.current())) {
+            await pool.query(
+              "DELETE FROM channel_slack_views WHERE installation=$1 AND session_id=$2 AND root_id=$3 AND state='sending' AND provider_id IS NULL",
+              [key, input.sessionId, input.rootMessageId],
+            );
+            return {};
+          }
+          const sent = await render();
+          if (!sent.ts || !timestamp.test(sent.ts))
+            throw new MessagingConnectionError('Slack failed: control_receipt_unavailable.');
+          const providerId = `${dm}:${sent.ts}`;
+          await pool.query(
+            "UPDATE channel_slack_views SET state='sent',provider_id=$3 WHERE installation=$1 AND session_id=$2 AND root_id=$4",
+            [key, input.sessionId, providerId, input.rootMessageId],
+          );
           viewError = undefined;
           updateRichError();
-          return { id: previous.provider_id };
+          return { id: providerId };
+        } catch (error) {
+          nextViewAt = Math.max(nextViewAt, Date.now() + retryAfter(error));
+          if (!lifetime.signal.aborted && !input.signal.aborted) {
+            viewError = failure(error).message;
+            updateRichError();
+          }
+          throw failure(error);
         }
-        const claim = await pool.query(
-          "INSERT INTO channel_slack_views(installation,session_id,root_id,state) VALUES($1,$2,$3,'sending') ON CONFLICT DO NOTHING RETURNING session_id",
-          [key, input.sessionId, input.rootMessageId],
-        );
-        if (!claim.rowCount) return {};
-        const sent = await render();
-        if (!sent.ts || !timestamp.test(sent.ts))
-          throw new MessagingConnectionError('Slack failed: control_receipt_unavailable.');
-        const providerId = `${dm}:${sent.ts}`;
-        await pool.query(
-          "UPDATE channel_slack_views SET state='sent',provider_id=$3 WHERE installation=$1 AND session_id=$2 AND root_id=$4",
-          [key, input.sessionId, providerId, input.rootMessageId],
-        );
-        viewError = undefined;
-        updateRichError();
-        return { id: providerId };
-      } catch (error) {
-        nextViewAt = Math.max(nextViewAt, Date.now() + retryAfter(error));
-        if (!lifetime.signal.aborted && !input.signal.aborted) {
-          viewError = failure(error).message;
-          updateRichError();
-        }
-        throw failure(error);
-      }
+      });
     },
     async poll(accept, _pair, react) {
       if (!enabled || !parsed.success || closed) return;
@@ -1183,6 +1219,8 @@ export function createSlackTransport(
             senderId: parsed.data.allowedUserId,
             messageId: `${verified!.dmId}:${event.ts}`,
             threadId: verified!.dmId,
+            installationId: installation(),
+            conversationRootMessageId: `${verified!.dmId}:${event.thread_ts ?? event.ts}`,
             text: command ? `/${command[1].toLowerCase()}` : text,
             sentAt: new Date(Number(event.ts) * 1000),
             ...(event.thread_ts && event.thread_ts !== event.ts

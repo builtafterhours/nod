@@ -24,6 +24,8 @@ interface Root {
   state: string;
   last_status: string | null;
   lifecycle_revision: string;
+  current?: boolean;
+  installation_id?: string;
 }
 
 export async function createChannelRich(
@@ -55,6 +57,18 @@ export async function createChannelRich(
     CREATE INDEX IF NOT EXISTS turns_rich_session_time ON turns(owner_id,session_id,created_at,id);
     CREATE INDEX IF NOT EXISTS channel_roots_dirty ON channel_roots(owner_id,session_id)
       WHERE state='open' AND (last_status IS NULL OR last_status IN ('processing','suspended'));`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS channel_main_conversations (
+    id uuid PRIMARY KEY,owner_id text NOT NULL,installation_id text NOT NULL,account_id text NOT NULL,
+    sender_id text NOT NULL,dm text NOT NULL,root_id text NOT NULL,thread_id uuid NOT NULL,session_id uuid NOT NULL,target_id uuid NOT NULL,
+    UNIQUE(owner_id,installation_id,account_id,sender_id,dm,root_id));
+    CREATE INDEX IF NOT EXISTS channel_main_root ON channel_main_conversations(owner_id,root_id);
+    CREATE TABLE IF NOT EXISTS channel_main_work (
+      owner_id text NOT NULL,turn_id uuid PRIMARY KEY,conversation_id uuid NOT NULL REFERENCES channel_main_conversations(id),
+      generation uuid NOT NULL,connection_revision uuid NOT NULL,nonce uuid,status_nonce uuid,expires_at timestamptz,
+      control_message_id text,last_status text,lifecycle_revision bigint NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS channel_main_dirty ON channel_main_work(owner_id,turn_id)
+      WHERE last_status IS NULL OR last_status IN ('processing','suspended');
+    CREATE INDEX IF NOT EXISTS channel_main_conversation_work ON channel_main_work(owner_id,conversation_id,turn_id);`);
   await pool.query(
     "UPDATE channel_roots SET state='uncertain',nonce=NULL WHERE owner_id=$1 AND state='preparing'",
     [options.ownerId],
@@ -74,6 +88,9 @@ export async function createChannelRich(
     await pool.query('DELETE FROM channel_retired_roots WHERE owner_id=$1', [options.ownerId]);
   let lifetime = new AbortController();
   let revision = randomUUID();
+  await pool.query('UPDATE channel_main_work SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1', [
+    options.ownerId,
+  ]);
   await pool.query(
     "UPDATE channel_streams SET state='uncertain' WHERE owner_id=$1 AND state NOT IN ('finalized','uncertain')",
     [options.ownerId],
@@ -90,6 +107,272 @@ export async function createChannelRich(
     options
       .transport()
       .channels.some((channel) => channel.id === 'slack' && channel.rich && channel.available);
+  const installation = () =>
+    options.transport().channels.find((channel) => channel.id === 'slack')?.installationId;
+  let mainCursor: string | null = null;
+  let taskCursor: string | null = null;
+  let boundCursor: string | null = null;
+
+  async function bindMain(
+    client: PoolClient,
+    receipt: {
+      account_id: string;
+      sender_id: string;
+      thread_id: string;
+      canonical_root_id: string | null;
+      installation_id: string | null;
+    },
+    turnId: string,
+    targetId: string,
+  ) {
+    if (
+      !receipt.canonical_root_id ||
+      !receipt.installation_id ||
+      receipt.installation_id !== installation()
+    )
+      return;
+    const turn = (
+      await client.query(
+        `SELECT u.thread_id,u.session_id FROM turns u JOIN threads th ON th.owner_id=u.owner_id AND th.id=u.thread_id
+       WHERE u.id=$1 AND u.owner_id=$2 AND u.session_id=u.thread_id AND u.source='user' AND NOT u.proactive AND th.archived_at IS NULL`,
+        [turnId, options.ownerId],
+      )
+    ).rows[0];
+    if (!turn) return;
+    await client.query(
+      `INSERT INTO channel_main_conversations(id,owner_id,installation_id,account_id,sender_id,dm,root_id,thread_id,session_id,target_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT DO NOTHING`,
+      [
+        randomUUID(),
+        options.ownerId,
+        receipt.installation_id,
+        receipt.account_id,
+        receipt.sender_id,
+        receipt.thread_id,
+        receipt.canonical_root_id,
+        turn.thread_id,
+        turn.session_id,
+        targetId,
+      ],
+    );
+    const conversation = (
+      await client.query(
+        `SELECT id FROM channel_main_conversations WHERE owner_id=$1 AND installation_id=$2 AND account_id=$3 AND sender_id=$4
+       AND dm=$5 AND root_id=$6 AND thread_id=$7 AND session_id=$8`,
+        [
+          options.ownerId,
+          receipt.installation_id,
+          receipt.account_id,
+          receipt.sender_id,
+          receipt.thread_id,
+          receipt.canonical_root_id,
+          turn.thread_id,
+          turn.session_id,
+        ],
+      )
+    ).rows[0];
+    if (!conversation) throw new Error('The Slack conversation binding has changed.');
+    if (!rich()) return;
+    used = true;
+    await client.query(
+      `INSERT INTO channel_main_work(owner_id,turn_id,conversation_id,generation,connection_revision)
+       VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+      [options.ownerId, turnId, conversation.id, randomUUID(), revision],
+    );
+  }
+
+  async function inheritMain(turnId: string) {
+    await pool.query(
+      `WITH RECURSIVE lineage AS (
+         SELECT u.id,u.parent_turn_id,u.owner_id,u.thread_id,u.channel,0 AS depth FROM turns u
+         WHERE u.id=$1 AND u.owner_id=$2 AND u.session_id=u.thread_id AND u.source='resume' AND NOT u.proactive
+         UNION ALL SELECT p.id,p.parent_turn_id,p.owner_id,p.thread_id,p.channel,c.depth+1 FROM lineage c JOIN turns p
+           ON p.id=c.parent_turn_id AND p.owner_id=c.owner_id AND p.thread_id=c.thread_id AND p.channel=c.channel WHERE c.depth<200)
+       INSERT INTO channel_main_work(owner_id,turn_id,conversation_id,generation,connection_revision)
+       SELECT $2,$1,w.conversation_id,$3,$4 FROM lineage l JOIN channel_main_work w ON w.turn_id=l.id AND w.owner_id=$2
+       JOIN channel_main_conversations c ON c.id=w.conversation_id AND c.installation_id=$5 ORDER BY l.depth LIMIT 1 ON CONFLICT DO NOTHING`,
+      [turnId, options.ownerId, randomUUID(), revision, installation() ?? null],
+    );
+  }
+
+  async function mainRoot(turnId: string): Promise<Root | undefined> {
+    if (!installation()) return;
+    await inheritMain(turnId);
+    return (
+      await pool.query<Root>(
+        `SELECT c.*,w.turn_id,w.nonce,w.status_nonce,w.expires_at,w.control_message_id,w.last_status,w.lifecycle_revision,
+        u.channel,'open' AS state,
+        u.id=COALESCE((SELECT live.id FROM turns live WHERE live.owner_id=u.owner_id AND live.session_id=u.session_id AND live.status='running'
+          ORDER BY live.created_at DESC,live.id DESC LIMIT 1),
+          (SELECT latest.id FROM turns latest WHERE latest.owner_id=u.owner_id AND latest.session_id=u.session_id ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1)) AS current
+       FROM channel_main_work w JOIN channel_main_conversations c ON c.id=w.conversation_id AND c.owner_id=w.owner_id
+       JOIN turns u ON u.id=w.turn_id AND u.owner_id=w.owner_id JOIN threads th ON th.id=c.thread_id AND th.owner_id=c.owner_id
+       WHERE w.owner_id=$1 AND w.turn_id=$2 AND c.installation_id=$3 AND th.archived_at IS NULL`,
+        [options.ownerId, turnId, installation() ?? null],
+      )
+    ).rows[0];
+  }
+
+  async function desiredStatus(
+    identity: { account_id: string; sender_id: string; thread_id: string },
+    root: string,
+  ) {
+    const row = (
+      await pool.query<{ status: string; current: boolean }>(
+        `SELECT u.status,u.id=COALESCE(
+          (SELECT live.id FROM turns live WHERE live.owner_id=u.owner_id AND live.session_id=u.session_id AND live.status='running' ORDER BY live.created_at DESC,live.id DESC LIMIT 1),
+          (SELECT latest.id FROM turns latest WHERE latest.owner_id=u.owner_id AND latest.session_id=u.session_id ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1)) AS current
+       FROM channel_main_conversations c JOIN channel_main_work w ON w.conversation_id=c.id AND w.owner_id=c.owner_id
+       JOIN turns u ON u.id=w.turn_id AND u.owner_id=w.owner_id
+       WHERE c.owner_id=$1 AND c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.root_id=$5 AND c.installation_id=$6
+       ORDER BY u.status='running' DESC,u.created_at DESC,u.id DESC LIMIT 1`,
+        [
+          options.ownerId,
+          identity.account_id,
+          identity.sender_id,
+          identity.thread_id,
+          root,
+          installation() ?? null,
+        ],
+      )
+    ).rows[0];
+    if (row && !row.current) return 'active' as const;
+    if (row)
+      return row.status === 'running' || row.status === 'queued'
+        ? ('processing' as const)
+        : row.status === 'waiting'
+          ? ('suspended' as const)
+          : ('active' as const);
+    const task = (
+      await pool.query<{ status: string; state: string }>(
+        `SELECT u.status,t.state FROM channel_roots r JOIN tasks t ON t.session_id=r.session_id AND t.owner_id=r.owner_id
+       JOIN turns u ON u.id=COALESCE(
+         (SELECT live.id FROM turns live WHERE live.owner_id=r.owner_id AND live.session_id=r.session_id AND live.status='running' ORDER BY live.created_at DESC,live.id DESC LIMIT 1),
+         (SELECT latest.id FROM turns latest WHERE latest.owner_id=r.owner_id AND latest.session_id=r.session_id ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1))
+       WHERE r.owner_id=$1 AND r.account_id=$2 AND r.sender_id=$3 AND r.dm=$4 AND r.root_id=$5 AND r.session_id<>r.thread_id`,
+        [options.ownerId, identity.account_id, identity.sender_id, identity.thread_id, root],
+      )
+    ).rows[0];
+    return task?.status === 'running' || task?.status === 'queued'
+      ? 'processing'
+      : task?.status === 'waiting'
+        ? 'suspended'
+        : task && task.state !== 'open'
+          ? 'closed'
+          : 'active';
+  }
+
+  async function stepMain(targetTurnId?: string) {
+    if (!installation()) return;
+    const signal = lifetime.signal;
+    const candidates = await pool.query<{ id: string }>(
+      `WITH candidates AS MATERIALIZED (
+         SELECT id FROM turns WHERE owner_id=$1 AND session_id=thread_id AND status IN ('queued','running','waiting') AND starts_with(channel,'slack:')
+         UNION SELECT turn_id FROM channel_main_work WHERE owner_id=$1 AND (last_status IS NULL OR last_status IN ('processing','suspended')))
+       SELECT id FROM candidates WHERE ($2::uuid IS NULL OR id=$2) AND ($2::uuid IS NOT NULL OR $3::uuid IS NULL OR id>$3)
+       ORDER BY id LIMIT 100`,
+      [options.ownerId, targetTurnId ?? null, mainCursor],
+    );
+    if (!targetTurnId)
+      mainCursor = candidates.rows.length === 100 ? candidates.rows.at(-1)!.id : null;
+    for (const candidate of candidates.rows) {
+      if (closed || signal.aborted || (!targetTurnId && preparing)) break;
+      const row = await mainRoot(candidate.id);
+      if (!row || !permitted(row)) continue;
+      const turn = (
+        await pool.query<{ status: string }>(
+          'SELECT status FROM turns WHERE id=$1 AND owner_id=$2',
+          [row.turn_id, options.ownerId],
+        )
+      ).rows[0];
+      if (!turn) continue;
+      if (!row.current && turn.status === 'queued') continue;
+      const desired = !row.current
+        ? 'active'
+        : turn.status === 'running' || turn.status === 'queued'
+          ? 'processing'
+          : turn.status === 'waiting'
+            ? 'suspended'
+            : 'active';
+      const nonce =
+        row.current && turn.status === 'running'
+          ? row.nonce && row.expires_at && row.expires_at.getTime() > Date.now()
+            ? row.nonce
+            : randomUUID()
+          : null;
+      const signature = JSON.stringify([
+        row.turn_id,
+        desired,
+        nonce,
+        desired === 'processing' ? Math.floor(Date.now() / (45 * 60_000)) : 0,
+      ]);
+      const key = `main:${row.turn_id}`;
+      if (shown.get(key) === signature && row.last_status === desired) continue;
+      if (
+        !row.current &&
+        (await desiredStatus({ ...row, thread_id: row.dm }, row.root_id!)) !== 'active'
+      ) {
+        await pool.query(
+          "UPDATE channel_main_work SET nonce=NULL,status_nonce=NULL,last_status='active' WHERE owner_id=$1 AND turn_id=$2",
+          [options.ownerId, row.turn_id],
+        );
+        continue;
+      }
+      const claim = (
+        await pool.query<{ lifecycle_revision: string; status_nonce: string }>(
+          `UPDATE channel_main_work SET nonce=$3,status_nonce=CASE WHEN nonce IS NOT DISTINCT FROM $3::uuid THEN status_nonce ELSE $4 END,
+         expires_at=CASE WHEN nonce IS NOT DISTINCT FROM $3::uuid THEN expires_at ELSE now()+interval '15 minutes' END,
+         connection_revision=$5,lifecycle_revision=lifecycle_revision+1 WHERE owner_id=$1 AND turn_id=$2 RETURNING lifecycle_revision,status_nonce`,
+          [options.ownerId, row.turn_id, nonce, randomUUID(), revision],
+        )
+      ).rows[0];
+      const current = async () => {
+        if (closed || signal.aborted || !permitted(row) || row.installation_id !== installation())
+          return false;
+        const latest = await mainRoot(row.turn_id);
+        if (!latest || latest.lifecycle_revision !== claim.lifecycle_revision) return false;
+        if (row.current && !latest.current) return false;
+        return (await desiredStatus({ ...row, thread_id: row.dm }, row.root_id!)) === desired;
+      };
+      try {
+        const view = await options.transport().conversation?.({
+          ownerId: options.ownerId,
+          channelId: 'slack',
+          accountId: row.account_id,
+          threadId: row.dm,
+          sessionId: row.session_id,
+          turnId: row.turn_id,
+          rootMessageId: row.root_id!,
+          status: desired,
+          title: 'Nod',
+          text: '',
+          control: nonce ? { stop: nonce, status: claim.status_nonce } : undefined,
+          outcome:
+            turn.status === 'failed' || turn.status === 'cancelled' ? turn.status : undefined,
+          signal,
+          current,
+        });
+        if (await current()) {
+          await pool.query(
+            `UPDATE channel_main_work SET last_status=$3,control_message_id=COALESCE($4,control_message_id)
+             WHERE owner_id=$1 AND turn_id=$2 AND lifecycle_revision=$5 AND connection_revision=$6`,
+            [
+              options.ownerId,
+              row.turn_id,
+              desired,
+              view?.id ?? null,
+              claim.lifecycle_revision,
+              revision,
+            ],
+          );
+          shown.set(key, signature);
+        }
+      } catch (cause) {
+        if (!signal.aborted) logFailure('channel_session_failed', cause);
+      }
+    }
+  }
 
   async function accept(input: MessagingControl) {
     if (
@@ -105,6 +388,7 @@ export async function createChannelRich(
           nonce: z.uuid().optional(),
           messageId: z.string().max(100).optional(),
           streamIds: z.array(z.string().min(1).max(100)).max(50).optional(),
+          installationId: z.string().min(1).max(100).optional(),
         })
         .safeParse(input).success
     )
@@ -113,7 +397,7 @@ export async function createChannelRich(
     const signal = lifetime.signal;
     const after = await (options.cancel ?? ((work) => transaction(work, pool)))(async (client) => {
       await options.lock?.(client);
-      const row = (
+      let row = (
         await client.query<Root>(
           `SELECT r.* FROM channel_roots r JOIN threads th ON th.id=r.thread_id AND th.owner_id=r.owner_id
          WHERE r.owner_id=$1 AND r.account_id=$2 AND r.sender_id=$3 AND r.dm=$4 AND r.root_id=$5
@@ -123,6 +407,30 @@ export async function createChannelRich(
           [options.ownerId, input.accountId, input.senderId, input.threadId, input.rootMessageId],
         )
       ).rows[0];
+      let main = false;
+      if (!row && input.installationId && input.installationId === installation()) {
+        row = (
+          await client.query<Root>(
+            `SELECT c.*,w.turn_id,w.nonce,w.status_nonce,w.expires_at,w.control_message_id,w.last_status,w.lifecycle_revision,u.channel,'open' AS state
+           FROM channel_main_conversations c JOIN channel_main_work w ON w.conversation_id=c.id AND w.owner_id=c.owner_id
+           JOIN turns u ON u.id=w.turn_id AND u.owner_id=w.owner_id JOIN threads th ON th.id=c.thread_id AND th.owner_id=c.owner_id
+           WHERE c.owner_id=$1 AND c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.root_id=$5 AND c.installation_id=$6
+             AND w.connection_revision=$7 AND u.status='running' AND th.archived_at IS NULL
+             AND u.id=(SELECT n.id FROM turns n WHERE n.owner_id=u.owner_id AND n.session_id=u.session_id AND n.status='running' ORDER BY n.created_at DESC,n.id DESC LIMIT 1)
+           FOR UPDATE OF w`,
+            [
+              options.ownerId,
+              input.accountId,
+              input.senderId,
+              input.threadId,
+              input.rootMessageId,
+              input.installationId,
+              revision,
+            ],
+          )
+        ).rows[0];
+        main = Boolean(row);
+      }
       if (!row || !permitted(row) || closed || lifetime.signal.aborted) return;
       if (
         input.nonce
@@ -163,6 +471,7 @@ export async function createChannelRich(
       if (!claim.rowCount) return;
       if (input.action === 'status') {
         shown.delete(row.session_id);
+        if (main) shown.delete(`main:${row.turn_id}`);
         return;
       }
       if (!options.control) return;
@@ -181,6 +490,11 @@ export async function createChannelRich(
         'UPDATE channel_roots SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1 AND session_id=$2',
         [options.ownerId, row.session_id],
       );
+      if (main)
+        await client.query(
+          'UPDATE channel_main_work SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1 AND turn_id=$2',
+          [options.ownerId, row.turn_id],
+        );
       return finish;
     });
     await after?.();
@@ -200,15 +514,33 @@ export async function createChannelRich(
     if (closed || !rich() || lifetime.signal.aborted) return;
     used = true;
     const signal = lifetime.signal;
+    await stepMain(targetTurnId);
+    const selected = await pool.query<{ session_id: string }>(
+      `SELECT session_id FROM (
+         SELECT session_id FROM turns WHERE owner_id=$1 AND session_id<>thread_id AND status IN ('queued','running','waiting') AND starts_with(channel,'slack:')
+         UNION SELECT session_id FROM channel_roots WHERE owner_id=$1 AND session_id<>thread_id AND state='open' AND (last_status IS NULL OR last_status IN ('processing','suspended'))
+       ) candidates WHERE ($2::uuid IS NULL OR session_id=$2) AND ($2::uuid IS NOT NULL OR $3::uuid IS NULL OR session_id>$3) ORDER BY session_id LIMIT 100`,
+      [options.ownerId, targetSessionId ?? null, taskCursor],
+    );
+    if (!targetSessionId)
+      taskCursor = selected.rows.length === 100 ? selected.rows.at(-1)!.session_id : null;
+    const bound = await pool.query<{ session_id: string }>(
+      `SELECT session_id FROM channel_roots WHERE owner_id=$1 AND session_id<>thread_id AND state='open'
+       AND (last_status IS NULL OR last_status IN ('processing','suspended')) AND ($2::uuid IS NULL OR session_id=$2)
+       AND ($2::uuid IS NOT NULL OR $3::uuid IS NULL OR session_id>$3) ORDER BY session_id LIMIT 100`,
+      [options.ownerId, targetSessionId ?? null, boundCursor],
+    );
+    if (!targetSessionId)
+      boundCursor = bound.rows.length === 100 ? bound.rows.at(-1)!.session_id : null;
     const retired = await pool.query<Root>(
       `WITH bound AS MATERIALIZED (
         SELECT * FROM channel_roots WHERE owner_id=$1 AND session_id<>thread_id AND state='open' AND (last_status IS NULL OR last_status IN ('processing','suspended'))
-          AND ($2::uuid IS NULL OR session_id=$2) ORDER BY session_id LIMIT 100)
+          AND session_id=ANY($2::uuid[]) ORDER BY session_id LIMIT 100)
       SELECT r.* FROM bound r JOIN threads th ON th.id=r.thread_id AND th.owner_id=r.owner_id AND th.archived_at IS NULL
       JOIN LATERAL (SELECT n.channel FROM turns n WHERE n.owner_id=r.owner_id AND n.session_id=r.session_id ORDER BY n.created_at DESC,n.id DESC LIMIT 1) latest ON latest.channel<>r.channel
       WHERE NOT EXISTS(SELECT 1 FROM turns live WHERE live.owner_id=r.owner_id AND live.session_id=r.session_id AND live.channel=r.channel AND live.status='running')
       `,
-      [options.ownerId, targetSessionId ?? null],
+      [options.ownerId, bound.rows.map((row) => row.session_id)],
     );
     for (const row of retired.rows) {
       if (!targetSessionId && preparing) break;
@@ -253,9 +585,7 @@ export async function createChannelRich(
     >(
       `WITH candidates AS MATERIALIZED (
          SELECT session_id FROM (
-           SELECT session_id FROM turns WHERE owner_id=$1 AND session_id<>thread_id AND status IN ('queued','running','waiting') AND starts_with(channel,'slack:') AND $2::uuid IS NULL
-           UNION SELECT session_id FROM channel_roots WHERE owner_id=$1 AND session_id<>thread_id AND state='open'
-             AND (last_status IS NULL OR last_status IN ('processing','suspended')) AND $2::uuid IS NULL
+           SELECT unnest($4::uuid[]) AS session_id WHERE $2::uuid IS NULL
            UNION SELECT $2::uuid WHERE $2::uuid IS NOT NULL
          ) sessions ORDER BY session_id LIMIT 100
        ), current AS MATERIALIZED (
@@ -286,7 +616,12 @@ export async function createChannelRich(
          AND u.session_id<>u.thread_id AND t.id IS NOT NULL
          AND work_origin.source='user' AND work_task.activity_key IS NULL
        ORDER BY u.session_id,i.received_at DESC`,
-      [options.ownerId, targetSessionId ?? null, targetTurnId ?? null],
+      [
+        options.ownerId,
+        targetSessionId ?? null,
+        targetTurnId ?? null,
+        selected.rows.map((row) => row.session_id),
+      ],
     );
     for (const row of rows) {
       if (!targetSessionId && preparing) break;
@@ -410,6 +745,20 @@ export async function createChannelRich(
           task,
           outcome: row.status === 'failed' || row.status === 'cancelled' ? row.status : undefined,
           signal,
+          current: async () => {
+            if (closed || signal.aborted || !permitted(row)) return false;
+            const current = await pool.query(
+              `SELECT 1 FROM channel_roots r WHERE r.owner_id=$1 AND r.session_id=$2 AND r.turn_id=$3 AND r.root_id=$4
+               AND r.turn_id=COALESCE(
+                 (SELECT live.id FROM turns live WHERE live.owner_id=r.owner_id AND live.session_id=r.session_id AND live.status='running' ORDER BY live.created_at DESC,live.id DESC LIMIT 1),
+                 (SELECT latest.id FROM turns latest WHERE latest.owner_id=r.owner_id AND latest.session_id=r.session_id ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1))`,
+              [options.ownerId, row.session_id, row.turn_id, row.root_id],
+            );
+            return (
+              Boolean(current.rowCount) &&
+              (await desiredStatus({ ...row, thread_id: row.dm }, row.root_id!)) === status
+            );
+          },
         });
         if (view?.id && !signal.aborted)
           await pool.query(
@@ -441,6 +790,30 @@ export async function createChannelRich(
   const timer = setInterval(refresh, 2000);
   timer.unref();
   return {
+    bindMain,
+    status: desiredStatus,
+    async resolveMain(
+      identity: { account_id: string; sender_id: string },
+      dm: string,
+      root: string,
+    ) {
+      const result = (
+        await pool.query<{ target_id: string; allowed: boolean }>(
+          `SELECT c.target_id,(c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.installation_id=$6 AND th.archived_at IS NULL) AS allowed
+         FROM channel_main_conversations c JOIN threads th ON th.id=c.thread_id AND th.owner_id=c.owner_id
+         WHERE c.owner_id=$1 AND c.root_id=$5 ORDER BY (c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.installation_id=$6) DESC LIMIT 1`,
+          [
+            options.ownerId,
+            identity.account_id,
+            identity.sender_id,
+            dm,
+            root,
+            installation() ?? null,
+          ],
+        )
+      ).rows[0];
+      return { known: Boolean(result), target: result?.allowed ? result.target_id : undefined };
+    },
     refresh,
     async prepare(sessionId: string, turnId?: string) {
       preparing++;
@@ -461,7 +834,19 @@ export async function createChannelRich(
     async root(
       identity: { account_id: string; sender_id: string; thread_id: string },
       sessionId: string,
+      turnId?: string,
     ) {
+      if (turnId) {
+        const main = await mainRoot(turnId);
+        if (
+          main &&
+          main.session_id === sessionId &&
+          main.account_id === identity.account_id &&
+          main.sender_id === identity.sender_id &&
+          main.dm === identity.thread_id
+        )
+          return main;
+      }
       return (
         await pool.query<Root>(
           `SELECT * FROM channel_roots r WHERE owner_id=$1 AND account_id=$2 AND sender_id=$3 AND session_id=$4 AND dm=$5 AND state='open'
@@ -511,7 +896,16 @@ export async function createChannelRich(
           'SELECT 1 FROM turns u JOIN tasks t ON t.owner_id=u.owner_id AND t.session_id=u.session_id WHERE u.owner_id=$1 AND u.id=$2 AND u.session_id<>u.thread_id',
           [options.ownerId, context.turnId],
         );
-        if (!task.rowCount)
+        const main = !task.rowCount ? await mainRoot(context.turnId) : undefined;
+        if (
+          !task.rowCount &&
+          (!main ||
+            !main.current ||
+            main.root_id !== context.rootMessageId ||
+            main.account_id !== identity.account_id ||
+            main.sender_id !== identity.sender_id ||
+            main.dm !== identity.thread_id)
+        )
           throw new Error('Rich Slack streams are available for task threads only.');
         if (update.state === 'starting') {
           const inserted = await pool.query(
@@ -594,6 +988,10 @@ export async function createChannelRich(
       await running;
       shown.clear();
       if (!used) return;
+      await pool.query(
+        'UPDATE channel_main_work SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1',
+        [options.ownerId],
+      );
       await pool.query('UPDATE channel_roots SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1', [
         options.ownerId,
       ]);
@@ -605,6 +1003,9 @@ export async function createChannelRich(
     resume() {
       lifetime = new AbortController();
       revision = randomUUID();
+      mainCursor = null;
+      taskCursor = null;
+      boundCursor = null;
       listen();
       refresh();
     },
@@ -615,6 +1016,10 @@ export async function createChannelRich(
       release?.();
       await running;
       if (!used) return;
+      await pool.query(
+        'UPDATE channel_main_work SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1',
+        [options.ownerId],
+      );
       await pool.query('UPDATE channel_roots SET nonce=NULL,status_nonce=NULL WHERE owner_id=$1', [
         options.ownerId,
       ]);
