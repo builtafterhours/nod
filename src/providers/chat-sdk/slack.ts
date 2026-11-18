@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { SocketModeClient, LogLevel } from '@slack/socket-mode';
+import { SocketModeClient, LogLevel, UnrecoverableSocketModeStartError } from '@slack/socket-mode';
 import {
   WebClient,
   WebAPIHTTPError,
@@ -105,6 +105,37 @@ function failure(error: unknown) {
   return new MessagingConnectionError(`Slack failed: ${reason}.`);
 }
 
+class SlackIdentityError extends MessagingConnectionError {}
+
+function terminalFailure(error: unknown) {
+  return (
+    error instanceof SlackIdentityError ||
+    (error instanceof WebAPIPlatformError &&
+      [
+        ...Object.values(UnrecoverableSocketModeStartError),
+        'token_revoked',
+        'token_expired',
+        'missing_scope',
+        'not_allowed_token_type',
+        'invalid_arguments',
+        'invalid_arg_name',
+        'user_not_found',
+        'bot_not_found',
+        'channel_not_found',
+      ].includes(error.data.error))
+  );
+}
+
+function retryAfter(error: unknown) {
+  const seconds =
+    error instanceof WebAPIRateLimitedError
+      ? error.retryAfter
+      : error instanceof WebAPIHTTPError
+        ? Number(error.headers['retry-after'])
+        : 0;
+  return Number.isFinite(seconds) ? Math.min(300, Math.max(0, seconds)) * 1000 : 0;
+}
+
 function client(token: string, signal: AbortSignal, request: typeof fetch = fetch) {
   return new WebClient(token, {
     logger,
@@ -132,9 +163,8 @@ class SlackSocket extends SocketModeClient {
     try {
       return await super.start();
     } catch (error) {
-      const cause = failure(error);
       await this.disconnect().catch(() => {});
-      this.emit('nod_start_failed', cause);
+      this.emit('nod_start_failed', error);
       return { ok: false };
     }
   }
@@ -158,7 +188,7 @@ class SlackSocket extends SocketModeClient {
       await super.onWebSocketMessage(...args);
     } catch (error) {
       await this.disconnect().catch(() => {});
-      this.emit('nod_start_failed', failure(error));
+      this.emit('nod_start_failed', error);
     }
   }
 }
@@ -195,7 +225,7 @@ async function connect(connection: SlackSocket, signal: AbortSignal) {
   const connected = new Promise<void>((resolve, reject) => {
     const failed = (error: Error) => reject(error);
     const identityFailed = () =>
-      reject(new MessagingConnectionError('Slack failed: app_identity_mismatch.'));
+      reject(new SlackIdentityError('Slack failed: app_identity_mismatch.'));
     const aborted = () =>
       reject(new MessagingConnectionError('Slack failed: connection_cancelled.'));
     connection.once('connected', resolve);
@@ -220,11 +250,11 @@ async function connect(connection: SlackSocket, signal: AbortSignal) {
 async function identity(web: WebClient, input: z.infer<typeof slackInput>) {
   const me = await web.auth.test();
   if (me.team_id !== input.teamId || !me.bot_id || !me.user_id)
-    throw new MessagingConnectionError('Slack failed: workspace_or_bot_mismatch.');
+    throw new SlackIdentityError('Slack failed: workspace_or_bot_mismatch.');
   const bot = await web.bots.info({ bot: me.bot_id });
   const appId = bot.bot?.app_id;
   if (!appId || !id.test(appId))
-    throw new MessagingConnectionError('Slack failed: bot_identity_unavailable.');
+    throw new SlackIdentityError('Slack failed: bot_identity_unavailable.');
   const owner = (await web.users.info({ user: input.allowedUserId })).user;
   if (
     !owner ||
@@ -235,11 +265,11 @@ async function identity(web: WebClient, input: z.infer<typeof slackInput>) {
     owner.deleted ||
     owner.id === me.user_id
   )
-    throw new MessagingConnectionError('Slack failed: owner_mismatch.');
+    throw new SlackIdentityError('Slack failed: owner_mismatch.');
   const dm = (await web.conversations.open({ users: input.allowedUserId, return_im: true }))
     .channel;
   if (!dm?.id || !/^D[A-Z0-9]{1,63}$/.test(dm.id))
-    throw new MessagingConnectionError('Slack failed: direct_message_unavailable.');
+    throw new SlackIdentityError('Slack failed: direct_message_unavailable.');
   const info = (await web.conversations.info({ channel: dm.id })).channel;
   if (
     !info?.is_im ||
@@ -248,7 +278,7 @@ async function identity(web: WebClient, input: z.infer<typeof slackInput>) {
     info.is_ext_shared ||
     z.object({ user: z.literal(input.allowedUserId) }).safeParse(info).success === false
   )
-    throw new MessagingConnectionError('Slack failed: direct_message_mismatch.');
+    throw new SlackIdentityError('Slack failed: direct_message_mismatch.');
   return { appId, botUserId: me.user_id, dmId: dm.id };
 }
 
@@ -373,6 +403,7 @@ export function createSlackTransport(
   let replacementNeeded = false;
   let attempts = 0;
   let nextAttempt = 0;
+  let terminal = false;
   let closed = false;
   const incoming = new Map<
     string,
@@ -450,96 +481,104 @@ export function createSlackTransport(
     };
   }
 
-  async function start() {
-    if (closed || !parsed.success || !enabled || starting) return starting;
-    if (replacementNeeded) {
-      await connection?.disconnect().catch(() => {});
-      connection?.removeAllListeners();
-      connection = undefined;
-      replacementNeeded = false;
-    }
-    if (connection) return;
-    if (attempts >= 5 || Date.now() < nextAttempt) return;
-    attempts++;
-    nextAttempt = Date.now() + Math.min(30_000, 2000 * 2 ** (attempts - 1));
-    starting = (async () => {
-      try {
-        verified = await identity(web!, parsed.data);
-        if (closed) return;
-        connection = socket(parsed.data.appToken, verified.appId, lifetime.signal);
-        connection.on('connected', () => {
-          if (!closed) {
+  function report(error: unknown) {
+    if (closed) return;
+    channel.available = false;
+    channel.error = failure(error).message;
+    replacementNeeded = true;
+    terminal ||= terminalFailure(error);
+    if (terminal) channel.error += ' Reconnect in Channels.';
+    nextAttempt =
+      Date.now() + Math.max(Math.min(30_000, 2000 * 2 ** (attempts - 1)), retryAfter(error));
+  }
+
+  function start() {
+    if (closed || !parsed.success || !enabled || starting || terminal || Date.now() < nextAttempt)
+      return;
+    if (connection && !replacementNeeded) return;
+    starting = Promise.resolve()
+      .then(async () => {
+        try {
+          if (replacementNeeded) {
+            await connection?.disconnect().catch(() => {});
+            connection?.removeAllListeners();
+            connection = undefined;
+            replacementNeeded = false;
+          }
+          if (closed) return;
+          attempts = Math.min(5, attempts + 1);
+          const checked = await identity(web!, parsed.data);
+          if (closed) return;
+          verified = checked;
+          const candidate = socket(parsed.data.appToken, checked.appId, lifetime.signal);
+          connection = candidate;
+          const current = () => !closed && connection === candidate;
+          candidate.on('disconnected', () => {
+            if (!current()) return;
+            channel.available = false;
+            replacementNeeded = true;
+          });
+          candidate.on('nod_start_failed', (error) => {
+            if (!current()) return;
+            report(error);
+            replacementNeeded = true;
+          });
+          candidate.on('error', (error) => {
+            if (current()) report(error);
+          });
+          candidate.on('nod_identity_failed', () => {
+            if (current()) report(new SlackIdentityError('Slack failed: app_identity_mismatch.'));
+          });
+          candidate.on('slack_event', ({ type, body, ack }) => {
+            const value = eventSchema.safeParse(body);
+            if (!current() || terminal) return;
+            if (
+              type !== 'events_api' ||
+              !value.success ||
+              value.data.team_id !== parsed.data.teamId ||
+              value.data.api_app_id !== verified?.appId ||
+              value.data.event.user !== parsed.data.allowedUserId ||
+              value.data.event.bot_id ||
+              value.data.event.user === verified.botUserId
+            ) {
+              void ack().catch(() => {});
+              return;
+            }
+            const event = value.data.event;
+            const dm = event.type === 'message' ? event.channel : event.item?.channel;
+            if (
+              dm !== verified.dmId ||
+              (event.type === 'message' &&
+                (event.channel_type !== 'im' ||
+                  (event.subtype &&
+                    !['file_share', 'thread_broadcast'].includes(event.subtype)))) ||
+              !['message', 'reaction_added', 'reaction_removed'].includes(event.type)
+            ) {
+              void ack().catch(() => {});
+              return;
+            }
+            if (incoming.size < 100 || incoming.has(value.data.event_id))
+              incoming.set(value.data.event_id, { body: value.data, ack });
+          });
+          await connect(candidate, AbortSignal.any([lifetime.signal, AbortSignal.timeout(20_000)]));
+          if (current() && !replacementNeeded && !terminal && verified === checked) {
             channel.available = true;
             channel.error = undefined;
             attempts = 0;
+            nextAttempt = 0;
           }
-        });
-        connection.on('disconnected', () => {
-          channel.available = false;
-          replacementNeeded = true;
-        });
-        connection.on('reconnecting', () => {
-          channel.available = false;
-        });
-        connection.on('nod_start_failed', (error) => {
-          channel.available = false;
-          channel.error = failure(error).message;
-          replacementNeeded = true;
-        });
-        connection.on('error', (error) => {
-          channel.available = false;
-          channel.error = failure(error).message;
-        });
-        connection.on('nod_identity_failed', () => {
-          channel.available = false;
-          channel.error = 'Slack failed: app_identity_mismatch.';
-        });
-        connection.on('slack_event', ({ type, body, ack }) => {
-          const value = eventSchema.safeParse(body);
-          if (closed) return;
-          if (
-            type !== 'events_api' ||
-            !value.success ||
-            value.data.team_id !== parsed.data.teamId ||
-            value.data.api_app_id !== verified?.appId ||
-            value.data.event.user !== parsed.data.allowedUserId ||
-            value.data.event.bot_id ||
-            value.data.event.user === verified.botUserId
-          ) {
-            void ack().catch(() => {});
-            return;
-          }
-          const event = value.data.event;
-          const dm = event.type === 'message' ? event.channel : event.item?.channel;
-          if (
-            dm !== verified.dmId ||
-            (event.type === 'message' &&
-              (event.channel_type !== 'im' ||
-                (event.subtype && !['file_share', 'thread_broadcast'].includes(event.subtype)))) ||
-            !['message', 'reaction_added', 'reaction_removed'].includes(event.type)
-          ) {
-            void ack().catch(() => {});
-            return;
-          }
-          if (incoming.size < 100 || incoming.has(value.data.event_id))
-            incoming.set(value.data.event_id, { body: value.data, ack });
-        });
-        await connect(connection, AbortSignal.any([lifetime.signal, AbortSignal.timeout(20_000)]));
-      } catch (error) {
-        channel.available = false;
-        channel.error = failure(error).message;
-        await connection?.disconnect().catch(() => {});
-        connection?.removeAllListeners();
-        connection = undefined;
-        replacementNeeded = false;
-        nextAttempt = Date.now() + Math.min(30_000, 2000 * 2 ** (attempts - 1));
-        if (attempts >= 5) channel.error += ' Reconnect in Channels.';
-        throw failure(error);
-      }
-    })().finally(() => {
-      starting = undefined;
-    });
-    return starting;
+        } catch (error) {
+          report(error);
+          await connection?.disconnect().catch(() => {});
+          connection?.removeAllListeners();
+          connection = undefined;
+          replacementNeeded = false;
+        }
+      })
+      .catch(report)
+      .finally(() => {
+        starting = undefined;
+      });
   }
 
   function target(input: { accountId: string; threadId: string }) {
@@ -577,7 +616,7 @@ export function createSlackTransport(
     channels: [channel],
     async poll(accept, _pair, react) {
       if (!enabled || !parsed.success || closed) return;
-      await start();
+      start();
       for (const [key, item] of incoming) {
         if (closed) return;
         const event = item.body.event;
@@ -805,7 +844,7 @@ export function createSlackTransport(
       channel.available = false;
       lifetime.abort();
       incoming.clear();
-      await connection?.disconnect();
+      await connection?.disconnect().catch(() => {});
       await starting?.catch(() => {});
       await Promise.allSettled(active);
       connection?.removeAllListeners();
