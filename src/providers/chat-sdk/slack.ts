@@ -12,7 +12,6 @@ import {
 import { get as emojiForName, which as nameForEmoji } from 'node-emoji';
 import type { Pool } from 'pg';
 import { z } from 'zod';
-import { parseMarkdown } from 'chat';
 import type {
   InboundMessage,
   InboundReaction,
@@ -27,51 +26,16 @@ import {
   MessagingDeliveryError,
 } from '../../ports/messaging.ts';
 import { isMessageReaction } from '../../shared/emoji.ts';
-import { slackMessages } from './format.ts';
+import {
+  slackPlan,
+  slackStreamParts,
+  validateSlackSource,
+  type SlackPlan,
+} from './slack-format.ts';
 
 const id = /^[A-Z][A-Z0-9]{1,63}$/;
 const timestamp = /^\d{10,16}\.\d{6}$/;
 const fileLimit = 20 * 1024 * 1024;
-function streamFragments(text: string, limit: number) {
-  const parts: string[] = [];
-  for (let offset = 0; offset < text.length;) {
-    let end = Math.min(text.length, offset + limit);
-    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
-    parts.push(text.slice(offset, end));
-    offset = end;
-  }
-  return parts;
-}
-function streamMessages(text: string) {
-  if (text.length <= 9000) return [text];
-  if (text.length > 100_000) return;
-  const root = parseMarkdown(text);
-  const pending: Array<{ type: string; children?: unknown[] }> = [root];
-  while (pending.length) {
-    const node = pending.pop()!;
-    if (['definition', 'linkReference', 'imageReference'].includes(node.type)) return;
-    pending.push(...((node.children ?? []) as typeof pending));
-  }
-  const parts: string[] = [];
-  let current = '';
-  let offset = 0;
-  for (const node of root.children) {
-    const end = node.position?.end.offset;
-    if (end === undefined) return;
-    const source = text.slice(offset, end);
-    if (source.length > 9000) return;
-    if (current.length + source.length > 9000) {
-      parts.push(current);
-      current = '';
-    }
-    current += source;
-    offset = end;
-  }
-  const tail = text.slice(offset);
-  if (current.length + tail.length > 9000) return;
-  parts.push(current + tail);
-  return parts;
-}
 const emojiAliases: Record<string, string> = {
   thinking_face: 'thinking',
   hugging_face: 'hugs',
@@ -458,6 +422,8 @@ export function createSlackTransport(
   let controlCalls = 0;
   let richReady: Promise<unknown> | undefined;
   let streamUnsupported = false;
+  let textBlocksUnsupported = false;
+  let nextTextAt = 0;
   let statusUnsupported = false;
   let cardsUnsupported = false;
   let viewError: string | undefined;
@@ -827,7 +793,7 @@ export function createSlackTransport(
     }
   }
 
-  async function streamReply(input: Parameters<MessagingTransport['post']>[0]) {
+  async function streamReply(input: Parameters<MessagingTransport['post']>[0], plan: SlackPlan) {
     if (!input.stream || !input.rootMessageId) return;
     const dm = target(input);
     const root = messageId(input.rootMessageId);
@@ -838,7 +804,7 @@ export function createSlackTransport(
     let openStreamId: string | undefined;
     let stoppingStream = false;
     if (!input.text) return;
-    const parts = streamMessages(input.text);
+    const parts = slackStreamParts(plan);
     if (!parts) return;
     const warning = (value: unknown) => {
       const result = z
@@ -858,7 +824,7 @@ export function createSlackTransport(
       updateRichError();
     };
     try {
-      for (const [part, text] of parts.entries()) {
+      for (const [part, planned] of parts.entries()) {
         signal.throwIfAborted();
         await input.stream.record({ part, state: 'starting' });
         claimedParts.push(part);
@@ -870,13 +836,20 @@ export function createSlackTransport(
             return streamWeb.chat.startStream({
               channel: dm,
               thread_ts: root,
-              chunks: [{ type: 'markdown_text', text: streamFragments(text, 3000)[0] }],
+              chunks: [{ type: 'blocks', blocks: planned.calls[0].blocks }],
             });
           });
         } catch (error) {
+          const responseTs =
+            error instanceof WebAPIPlatformError && 'ts' in error.data ? error.data.ts : undefined;
+          if (typeof responseTs === 'string' && timestamp.test(responseTs)) {
+            openStreamId = `${dm}:${responseTs}`;
+            ids.push(openStreamId);
+          }
           if (
             !ids.length &&
             error instanceof WebAPIPlatformError &&
+            !('ts' in error.data) &&
             [
               'missing_scope',
               'not_allowed_token_type',
@@ -940,12 +913,11 @@ export function createSlackTransport(
         const providerId = `${dm}:${started.ts}`;
         openStreamId = providerId;
         ids.push(providerId);
-        const fragments = streamFragments(text, 3000);
-        let confirmedChars = fragments[0].length;
+        let confirmedChars = planned.calls[0].end - planned.from;
         await input.stream.record({ part, state: 'open', id: providerId, confirmedChars });
         warning(started);
         const deadline = Date.now() + 8 * 60_000;
-        for (const fragment of fragments.slice(1)) {
+        for (const call of planned.calls.slice(1)) {
           signal.throwIfAborted();
           if (Date.now() > deadline)
             throw new MessagingConnectionError('Slack failed: stream_deadline_exceeded.');
@@ -954,10 +926,10 @@ export function createSlackTransport(
           const appended = await streamWeb.chat.appendStream({
             channel: dm,
             ts: started.ts,
-            chunks: [{ type: 'markdown_text', text: fragment }],
+            chunks: [{ type: 'blocks', blocks: call.blocks }],
           });
           warning(appended);
-          confirmedChars += fragment.length;
+          confirmedChars = call.end - planned.from;
           await input.stream.record({ part, state: 'open', id: providerId, confirmedChars });
         }
         signal.throwIfAborted();
@@ -1314,32 +1286,104 @@ export function createSlackTransport(
         ...(input.signal ? [input.signal] : []),
       ]);
       const postWeb = client(parsed.success ? parsed.data.botToken : '', sendSignal);
-      if (channel.rich && input.stream && !streamUnsupported) {
-        const result = await streamReply(input);
+      let plan: SlackPlan;
+      try {
+        for (const file of input.attachments ?? []) validateSlackSource(file.name);
+        plan = slackPlan(
+          input.text || input.attachments?.map((file) => file.name).join('\n') || '',
+          !input.text,
+        );
+      } catch (error) {
+        throw new MessagingDeliveryError(
+          error instanceof Error ? error.message : 'Slack rendering failed.',
+          [],
+        );
+      }
+      if (
+        channel.rich &&
+        input.stream &&
+        !streamUnsupported &&
+        !textBlocksUnsupported &&
+        !input.attachments?.length
+      ) {
+        const result = await streamReply(input, plan);
         if (result) return result;
       }
       const ids: string[] = [];
-      try {
-        const parts = slackMessages(
-          input.text || input.attachments?.map((file) => file.name).join('\n') || '',
-        );
-        for (const text of parts) {
+      const send = async (rendered: SlackPlan) => {
+        let parts = textBlocksUnsupported ? rendered.plain : rendered.parts;
+        for (let part = 0; part < parts.length; part++) {
           sendSignal.throwIfAborted();
+          const planned = parts[part];
           const result = await operation(() =>
-            postWeb.chat.postMessage({
-              channel: dm,
-              ...(input.rootMessageId ? { thread_ts: messageId(input.rootMessageId) } : {}),
-              text,
-              unfurl_links: false,
-              unfurl_media: false,
-              parse: 'none',
-              link_names: false,
+            serialize(input.rootMessageId ?? dm, async () => {
+              const wait = Math.max(0, nextTextAt - Date.now());
+              if (wait) await delay(wait, undefined, { signal: sendSignal });
+              sendSignal.throwIfAborted();
+              nextTextAt = Date.now() + 1000;
+              try {
+                return await postWeb.chat.postMessage({
+                  channel: dm,
+                  ...(input.rootMessageId ? { thread_ts: messageId(input.rootMessageId) } : {}),
+                  text: planned.text,
+                  ...(planned.blocks ? { blocks: planned.blocks } : {}),
+                  mrkdwn: false,
+                  unfurl_links: false,
+                  unfurl_media: false,
+                  parse: 'none',
+                  link_names: false,
+                });
+              } catch (error) {
+                nextTextAt = Math.max(nextTextAt, Date.now() + retryAfter(error));
+                const responseTs =
+                  error instanceof WebAPIPlatformError && 'ts' in error.data
+                    ? error.data.ts
+                    : undefined;
+                if (typeof responseTs === 'string' && timestamp.test(responseTs))
+                  ids.push(`${dm}:${responseTs}`);
+                if (
+                  part === 0 &&
+                  !ids.length &&
+                  planned.blocks &&
+                  error instanceof WebAPIPlatformError &&
+                  !('ts' in error.data) &&
+                  ['invalid_blocks', 'invalid_blocks_format'].includes(error.data.error)
+                ) {
+                  textBlocksUnsupported = true;
+                  return undefined;
+                }
+                throw error;
+              }
             }),
           );
+          if (!result) {
+            parts = rendered.plain;
+            part = -1;
+            continue;
+          }
           if (!result.ts || !timestamp.test(result.ts))
             throw new MessagingConnectionError('Slack failed: message_receipt_unavailable.');
           ids.push(`${dm}:${result.ts}`);
+          const response = z
+            .object({
+              warning: z.string().optional(),
+              response_metadata: z.object({ warnings: z.array(z.string()).optional() }).optional(),
+            })
+            .parse(result);
+          const warnings = [
+            response.warning,
+            ...(response.response_metadata?.warnings ?? []),
+          ].filter(Boolean);
+          if (warnings.length) {
+            const reason = warnings[0]!;
+            throw new MessagingConnectionError(
+              `Slack failed: ${/^[a-z_]{1,80}$/.test(reason) ? reason : 'message_response_warning'}.`,
+            );
+          }
         }
+      };
+      try {
+        await send(plan);
         const unsent: string[] = [];
         let uncertain: MessagingConnectionError | undefined;
         for (const [part, file] of (input.attachments ?? []).entries()) {
@@ -1454,21 +1498,15 @@ export function createSlackTransport(
         if (unsent.length) {
           const notice = await input.attachmentFailure?.(unsent);
           if (!notice) throw new MessagingConnectionError('Slack failed: attachment_unavailable.');
-          for (const text of slackMessages(notice)) {
-            const sent = await operation(() =>
-              postWeb.chat.postMessage({
-                channel: dm,
-                ...(input.rootMessageId ? { thread_ts: messageId(input.rootMessageId) } : {}),
-                text,
-                unfurl_links: false,
-                unfurl_media: false,
-                parse: 'none',
-              }),
+          let noticePlan: SlackPlan;
+          try {
+            noticePlan = slackPlan(notice);
+          } catch (error) {
+            throw new MessagingConnectionError(
+              error instanceof Error ? error.message : 'Slack rendering failed.',
             );
-            if (!sent.ts || !timestamp.test(sent.ts))
-              throw new MessagingConnectionError('Slack failed: message_receipt_unavailable.');
-            ids.push(`${dm}:${sent.ts}`);
           }
+          await send(noticePlan);
         }
         if (uncertain) throw uncertain;
         return { id: ids[0] ?? '', ids };
