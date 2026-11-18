@@ -260,7 +260,7 @@ export async function captureOwnerInstructions(
           status: current.approval_status,
         }
       : undefined;
-  const before = current?.no_reply_context
+  const answered = current?.no_reply_context
     ? undefined
     : (taskId
         ? await pool.query<{ id: string; text: string }>(
@@ -294,6 +294,10 @@ export async function captureOwnerInstructions(
             [ownerId, threadId, latest.id, since],
           )
       ).rows[0];
+  const before =
+    answered && (await slackTopLevelUnanswered(pool, ownerId, latest.id, answered.id))
+      ? undefined
+      : answered;
   const ordered = users.reverse();
   return {
     evidence: {
@@ -320,6 +324,31 @@ export async function captureOwnerInstructions(
       ? { shortNeedsApproval: true }
       : {}),
   };
+}
+
+async function slackTopLevelUnanswered(
+  pool: Pick<Pool, 'query'>,
+  ownerId: string,
+  messageId: string,
+  answeredId: string,
+) {
+  if (
+    !(await pool.query("SELECT to_regclass('channel_main_work') IS NOT NULL AS rich")).rows[0].rich
+  )
+    return false;
+  return Boolean(
+    (
+      await pool.query(
+        `SELECT 1 FROM messages m JOIN channel_inbox i ON i.owner_id=m.owner_id AND i.message_id=m.id
+           AND i.provider='slack' AND i.provider_reply_id IS NULL
+         JOIN channel_main_work w ON w.owner_id=i.owner_id AND w.turn_id=i.turn_id
+         WHERE m.owner_id=$1 AND m.id=$2 AND m.reply_to_message_id IS NULL AND NOT EXISTS (
+           SELECT 1 FROM channel_outbox o WHERE o.message_id=$3
+             AND o.dispatched_installation_id IS NOT NULL AND o.dispatched_root_id IS NULL)`,
+        [ownerId, messageId, answeredId],
+      )
+    ).rowCount,
+  );
 }
 
 export async function validateInstructionChange(

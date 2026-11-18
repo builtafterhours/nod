@@ -2042,6 +2042,27 @@ test(
           }
 
           await finish();
+          const plain = await inbound('Synthetic top-level conversation');
+          await status(plain.turn, 'running');
+          config.rich = false;
+          await send(plain.turn, 'I can send the synthetic invoice. Shall I send it?');
+          config.rich = true;
+          assert.equal(posts.at(-1).rootMessageId, undefined);
+          await status(plain.turn, 'succeeded');
+          const topLevelYes = await inbound('Yes, do that');
+          assert.equal(await answered(topLevelYes.turn), 'I can send the synthetic invoice. Shall I send it?');
+          await finish();
+          const threaded = await inbound('Synthetic threaded conversation');
+          await status(threaded.turn, 'running');
+          const inThread = await send(threaded.turn, 'I can send the synthetic report. Shall I send it?');
+          assert.equal(inThread.post.rootMessageId, threaded.id);
+          await status(threaded.turn, 'succeeded');
+          const threadedYes = await inbound('Yes, do that');
+          assert.deepEqual(await stored(threadedYes.turn), { parent_turn_id: null, reply_to_message_id: null });
+          assert.equal((await q('SELECT no_reply_context FROM messages WHERE id=$1', [threadedYes.message_id])).rows[0].no_reply_context, false);
+          assert.equal(await answered(threadedYes.turn), undefined);
+
+          await finish();
           const owned = await inbound('Synthetic identity conversation');
           await status(owned.turn, 'waiting', 'question');
           await send(owned.turn, 'Synthetic identity question');
