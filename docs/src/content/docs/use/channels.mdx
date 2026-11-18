@@ -119,6 +119,10 @@ Every Nod message arrives at the top level of the DM, not as a child in a Slack 
 
 This is the default connection. With **Rich Slack**, ordinary replies and task files use session threads. Approval questions still arrive separately at the top level: answer in that exact question's thread, or react to that exact question. A task thread does not select a child approval question. Partially or uncertainly delivered Slack questions cannot approve an action. An unaddressed DM reply cannot approve one either.
 
+Slack replies use native headings, styled text, numbered and nested lists, quotes, and code where the source can be preserved safely. Tables arrive as stacked labelled rows, including empty fields and extra cells. Long replies continue in ordered parts. A table row too large for one stream uses ordinary split replies instead. Captions use the same rendering; filenames stay literal. Every ordinary part includes its complete plain-text equivalent for notifications and screen readers. A definite first-message formatting rejection can use that plain equivalent instead; an uncertain or partial send is never repeated automatically. A truncation or other response warning does not count as a fully delivered question.
+
+Some messages deliberately show their original Markdown instead. Any ampersand, backslash, less-than sign, percent sign, carriage return, tab, or byte-order mark selects literal text for the whole message, even in innocent prose or code. References, images, automatic links, unsupported syntax, and source-position or size limits can do the same. These messages do not stream. Encoded text stays encoded as written, without reconstructing a destination. This formatting safeguard does not fix the existing server filter's handling of encoded private links. Text with NUL or invalid Unicode is refused before sending, not silently replaced.
+
 Use these as ordinary DM text, not workspace slash commands:
 
 | Send                                    | To get                                         |
@@ -207,7 +211,7 @@ If a restart leaves task-thread or control delivery uncertain, Nod does not retr
 Task cards show saved task state alongside the current activity and planned steps. Nod does not mark individual planned steps complete without evidence. Waiting is not success. Media uses Slack-hosted file uploads in the task thread; outgoing audio is a file, not a claimed native recording. A threaded file receipt without a verified parent remains uncertain. Unsupported cards, workspace policies, missing scopes, and client behavior can reduce native affordances; ordinary messages and private Nod controls remain available.
 
 :::caution[Slack acceptance]
-This channel has not yet been accepted against an owner-authorized Slack test workspace. Workspace policy, mobile audio, file receipts, and reconnect behavior still need that check.
+This channel has not yet been accepted against an owner-authorized Slack test workspace. Native formatting, nested-entity display, no-ping and automatic-link behavior, notifications and accessibility still need desktop and mobile checks, alongside workspace policy, mobile audio, file receipts, and reconnect behavior. Local rendering checks are not native Slack acceptance.
 :::
 
 <details>
