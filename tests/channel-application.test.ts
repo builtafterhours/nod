@@ -2045,12 +2045,16 @@ test(
           const plain = await inbound('Synthetic top-level conversation');
           await status(plain.turn, 'running');
           config.rich = false;
-          await send(plain.turn, 'I can send the synthetic invoice. Shall I send it?');
+          const topLevel = await send(plain.turn, 'I can send the synthetic invoice. Shall I send it?');
           config.rich = true;
           assert.equal(posts.at(-1).rootMessageId, undefined);
           await status(plain.turn, 'succeeded');
           const topLevelYes = await inbound('Yes, do that');
           assert.equal(await answered(topLevelYes.turn), 'I can send the synthetic invoice. Shall I send it?');
+          await finish();
+          await q("UPDATE channel_outbox SET state='uncertain' WHERE message_id=$1", [topLevel.id]);
+          const uncertainYes = await inbound('Yes, do that');
+          assert.equal(await answered(uncertainYes.turn), undefined);
           await finish();
           const threaded = await inbound('Synthetic threaded conversation');
           await status(threaded.turn, 'running');
