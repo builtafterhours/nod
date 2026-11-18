@@ -974,9 +974,18 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const channel = conversationChannel(pending);
     if (closed || replacing) return false;
     const permittedBeforeAnswer = permitted(pending);
-    const replyToMessageId = pending.provider_reply_id
+    const resolvedReply = pending.provider_reply_id
       ? await nativeReply(pending, pending.thread_id, pending.provider_reply_id)
       : undefined;
+    const replyToMessageId =
+      resolvedReply && pending.provider === 'slack'
+        ? (
+            await pool.query<{ id: string }>(
+              `SELECT m.id FROM messages m JOIN threads th ON th.id=m.thread_id WHERE m.id=$1 AND m.owner_id=$2 AND th.owner_id=$2 AND th.archived_at IS NULL`,
+              [resolvedReply, ownerId],
+            )
+          ).rows[0]?.id
+        : resolvedReply;
     const hiddenBeforeAnswer = replyToMessageId
       ? await hiddenReplyTarget(pool, replyToMessageId)
       : undefined;
@@ -1012,6 +1021,22 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       );
       const row = result.rows[0];
       if (!row) return;
+      if (
+        permitted(row) &&
+        row.provider === 'slack' &&
+        row.provider_reply_id &&
+        !replyToMessageId
+      ) {
+        const threadId = options.activeThread ? (await options.activeThread(client)).id : null;
+        await saveReply(client, row.source_id, threadId, {
+          text: 'That Slack thread is no longer available. Send a new direct message, or reply to a current Nod message.',
+        });
+        await client.query(
+          "UPDATE channel_inbox SET state='discarded' WHERE source_id=$1 AND owner_id=$2",
+          [row.source_id, ownerId],
+        );
+        return true;
+      }
       const currentThread = row.conversation_thread_id
         ? await options.activeThread?.(client)
         : undefined;

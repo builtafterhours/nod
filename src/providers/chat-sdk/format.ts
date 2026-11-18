@@ -200,3 +200,19 @@ export function telegramText(markdown: string | Root) {
 export function whatsappText(markdown: string) {
   return render(parseMarkdown(markdown), whatsapp, markdown);
 }
+
+export function slackText(markdown: string) {
+  const escape = (value: string) =>
+    value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  return render(
+    parseMarkdown(markdown),
+    {
+      ...whatsapp,
+      text: escape,
+      code: (value) => `\`${escape(value).replaceAll('`', "'")}\``,
+      block: (value) => `\`\`\`\n${escape(value).replaceAll('```', "'''")}\n\`\`\``,
+      link: (label, url) => `<${escape(url).replaceAll('|', '%7C')}|${label.replaceAll('|', ' ')}>`,
+    },
+    markdown,
+  );
+}
