@@ -101,6 +101,13 @@ export const slackInput = z
 
 function failure(error: unknown) {
   if (error instanceof MessagingConnectionError) return error;
+  const source = (error instanceof WebAPIRequestError ? error.original : error) as
+    { code?: unknown; cause?: { code?: unknown } } | undefined;
+  const code = source?.code ?? source?.cause?.code;
+  const detail =
+    typeof code === 'string' && /^(?:[0-9A-Z]{5}|[A-Z][A-Z0-9_]{0,31})$/.test(code)
+      ? ` (${code})`
+      : '';
   const reason =
     error instanceof WebAPIPlatformError && /^[a-z_]{1,80}$/.test(error.data.error)
       ? error.data.error
@@ -109,8 +116,8 @@ function failure(error: unknown) {
         : error instanceof WebAPIRateLimitedError
           ? `rate_limited (retry after ${Math.min(86400, Math.max(0, error.retryAfter))} seconds)`
           : error instanceof WebAPIRequestError
-            ? 'network_request_failed'
-            : 'connection_failed';
+            ? `network_request_failed${detail}`
+            : `connection_failed${detail}`;
   return new MessagingConnectionError(`Slack failed: ${reason}.`);
 }
 
