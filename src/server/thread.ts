@@ -28,6 +28,7 @@ import { afterCommit, afterRollback, transaction } from './transaction.ts';
 import {
   laterSupersedingTurnSql,
   turnChainSql,
+  waitingTurnSql,
   withdrawnSql,
   workKindSql,
   workOriginSql,
@@ -131,6 +132,7 @@ interface SubmitUserMessageOptions {
   persistSubmission?: (client: PoolClient, result: SubmitUserMessageResult) => Promise<void>;
   onInserted?: () => void;
   stopSignal?: AbortSignal;
+  replyContext?: 'none';
 }
 export interface SubmitUserMessageResult {
   threadId: string;
@@ -597,6 +599,8 @@ async function readAnswer(
   options: SubmitUserMessageOptions,
   confirmAction?: ConfirmAction,
 ) {
+  assertReplyContext(options);
+  if (options.replyContext === 'none') return undefined;
   return confirmAction?.answer({
     text,
     channel: options.channel ?? 'web',
@@ -605,6 +609,85 @@ async function readAnswer(
     seenMessageId: options.seenMessageId,
     hasAttachments,
   });
+}
+
+function assertReplyContext(options: SubmitUserMessageOptions) {
+  if (
+    options.replyContext === 'none' &&
+    (options.replyToMessageId !== undefined ||
+      options.replyQuote !== undefined ||
+      options.seenMessageId !== undefined ||
+      options.questionAnswer !== undefined ||
+      options.approvalAnswer !== undefined ||
+      options.answer !== undefined)
+  )
+    throw httpError('A new request cannot answer a previous message.', 400);
+}
+
+async function assertFreshRequest(client: PoolClient, threadId: string) {
+  const candidates = await client.query(
+    `WITH candidates AS MATERIALIZED (
+       (SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2 AND status='running' ORDER BY id LIMIT 2)
+       UNION (SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2
+         AND NOT (status='succeeded' AND started_at IS NULL AND message_id IS NOT NULL AND source IN ('user','task'))
+         ORDER BY created_at DESC,id DESC LIMIT 1)
+       UNION (SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2 AND started_at IS NOT NULL ORDER BY started_at DESC LIMIT 1)
+       UNION (SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2 AND status='waiting' AND waiting_reason='credentials' AND started_at IS NULL
+         ORDER BY created_at DESC,id DESC LIMIT 1))
+     SELECT u.id,u.status,u.waiting_reason,u.created_at::text,u.started_at::text FROM turns u JOIN candidates c ON c.id=u.id
+     WHERE u.owner_id=$1 AND u.thread_id=$2 ORDER BY u.id FOR NO KEY UPDATE OF u`,
+    [ownerId, threadId],
+  );
+  const unavailable = (
+    message = 'Nod is waiting for an answer. Reply to the current question or send a new direct message.',
+  ) => Object.assign(httpError(message, 409), { code: 'reply_context_unavailable' });
+  if (candidates.rows.filter((row) => row.status === 'running').length > 1)
+    throw unavailable(
+      'Nod cannot safely start a new request while more than one turn is running in this conversation.',
+    );
+  const credentials = (await client.query("SELECT to_regclass('credential_requests') AS name"))
+    .rows[0]?.name;
+  for (const row of candidates.rows) {
+    const current = (
+      await client.query(
+        `SELECT NOT EXISTS (SELECT 1 FROM (
+           SELECT n.created_at,n.id FROM turns n WHERE n.owner_id=$1 AND n.session_id=$2
+             AND NOT (n.status='succeeded' AND n.started_at IS NULL AND n.message_id IS NOT NULL AND n.source IN ('user','task'))
+           ORDER BY n.created_at DESC,n.id DESC LIMIT 1) latest WHERE (latest.created_at,latest.id)>(u.created_at,u.id)) AS question_current,
+         (${waitingTurnSql('u', 'credentials')}) AS credentials_current
+       FROM (SELECT $1::text AS owner_id,$2::uuid AS session_id,$3::timestamptz AS created_at,$4::uuid AS id,
+         $5::timestamptz AS started_at,$6::text AS status,$7::text AS waiting_reason,$2::uuid AS thread_id) u`,
+        [ownerId, threadId, row.created_at, row.id, row.started_at, row.status, row.waiting_reason],
+      )
+    ).rows[0];
+    if (
+      row.status === 'waiting' &&
+      (row.waiting_reason === 'credentials'
+        ? current.credentials_current
+        : current.question_current)
+    )
+      throw unavailable();
+    if (row.status !== 'running') continue;
+    if (
+      (
+        await client.query(
+          "SELECT 1 FROM approvals WHERE owner_id=$1 AND turn_id=$2 AND status='pending' LIMIT 1",
+          [ownerId, row.id],
+        )
+      ).rowCount
+    )
+      throw unavailable();
+    if (
+      credentials &&
+      (
+        await client.query(
+          "SELECT 1 FROM credential_requests WHERE owner_id=$1 AND turn_id=$2 AND status='pending' LIMIT 1",
+          [ownerId, row.id],
+        )
+      ).rowCount
+    )
+      throw unavailable();
+  }
 }
 
 type TaskReply = (
@@ -625,6 +708,8 @@ export async function submitUserMessage(
   onAccepted?: (channel: string) => void,
 ): Promise<SubmitUserMessageResult> {
   const stop = options.stopSignal ?? stopSignal();
+  const noReplyContext = options.replyContext === 'none';
+  assertReplyContext(options);
   validateSource(options.sourceId, options.channel);
   const channel = options.channel ?? 'web';
   const confirmation = {
@@ -645,13 +730,14 @@ export async function submitUserMessage(
       confirmation.hasAttachments)
   )
     throw httpError('Answer the approval with the button you chose.', 400);
-  const answer = options.questionAnswer
-    ? undefined
-    : options.approvalAnswer
-      ? options.approvalAnswer
-      : options.client
-        ? options.answer
-        : await readAnswer(text, confirmation.hasAttachments, options, confirmAction);
+  const answer =
+    noReplyContext || options.questionAnswer
+      ? undefined
+      : options.approvalAnswer
+        ? options.approvalAnswer
+        : options.client
+          ? options.answer
+          : await readAnswer(text, confirmation.hasAttachments, options, confirmAction);
   let inserted = false;
   const markInserted = () => {
     inserted = true;
@@ -664,7 +750,7 @@ export async function submitUserMessage(
     if (options.clientMessageId) {
       const previous = (
         await client.query(
-          'SELECT id,owner_id,role,text,display_text,audio_caption,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,question_answer,approval_answer,(SELECT a.id FROM approvals a WHERE a.execution_turn_id=messages.turn_id AND a.owner_id=messages.owner_id LIMIT 1) AS approval_id FROM messages WHERE id=$1',
+          'SELECT id,owner_id,role,text,display_text,audio_caption,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,question_answer,approval_answer,no_reply_context,(SELECT a.id FROM approvals a WHERE a.execution_turn_id=messages.turn_id AND a.owner_id=messages.owner_id LIMIT 1) AS approval_id FROM messages WHERE id=$1',
           [options.clientMessageId],
         )
       ).rows[0];
@@ -672,6 +758,7 @@ export async function submitUserMessage(
         if (
           previous.owner_id !== ownerId ||
           previous.role !== 'user' ||
+          previous.no_reply_context !== noReplyContext ||
           previous.thread_id !== thread.id ||
           previous.text !== text ||
           previous.display_text !== (options.displayText ?? null) ||
@@ -691,12 +778,15 @@ export async function submitUserMessage(
     }
     if (options.sourceId) {
       const prior = (
-        await client.query('SELECT id,message_id FROM turns WHERE owner_id=$1 AND source_id=$2', [
-          ownerId,
-          options.sourceId,
-        ])
+        await client.query(
+          'SELECT u.id,u.message_id,m.no_reply_context FROM turns u LEFT JOIN messages m ON m.id=u.message_id AND m.owner_id=u.owner_id WHERE u.owner_id=$1 AND u.source_id=$2',
+          [ownerId, options.sourceId],
+        )
       ).rows[0];
-      if (prior) return { threadId: thread.id, turnId: prior.id, messageId: prior.message_id };
+      if (prior) {
+        if (Boolean(prior.no_reply_context) !== noReplyContext) throw messageIdInUse();
+        return { threadId: thread.id, turnId: prior.id, messageId: prior.message_id };
+      }
     }
     await assertReplyTarget(client, thread.id, options.replyToMessageId);
     let choiceQuestion: { id: string; session_id: string; background: boolean } | undefined;
@@ -741,7 +831,7 @@ export async function submitUserMessage(
       throw httpError('Select a passage of 4,000 characters or fewer.');
     const live = !stop.aborted;
     const confirmed =
-      options.questionAnswer || !live
+      noReplyContext || options.questionAnswer || !live
         ? undefined
         : await confirmAction?.accept(
             client,
@@ -769,22 +859,24 @@ export async function submitUserMessage(
       live &&
       options.replyToMessageId &&
       (await taskReply?.(client, thread.id, options.replyToMessageId));
-    const question = live
-      ? taskTarget ||
-        choiceQuestion ||
-        confirmed?.waiting ||
-        (
-          await client.query(
-            `SELECT u.id,u.session_id,u.background FROM turns u JOIN messages m ON m.turn_id=u.id AND m.owner_id=u.owner_id
+    if (noReplyContext && live) await assertFreshRequest(client, thread.id);
+    const question =
+      live && !noReplyContext
+        ? taskTarget ||
+          choiceQuestion ||
+          confirmed?.waiting ||
+          (
+            await client.query(
+              `SELECT u.id,u.session_id,u.background FROM turns u JOIN messages m ON m.turn_id=u.id AND m.owner_id=u.owner_id
        WHERE u.owner_id=$1 AND u.thread_id=$2 AND (u.channel=$3 OR $4::uuid IS NOT NULL) AND u.status='waiting' AND u.waiting_reason='question'
          AND m.role='assistant' AND (($4::uuid IS NOT NULL AND m.id=$4) OR ($4::uuid IS NULL AND u.session_id=$2))
          AND m.id=(SELECT q.id FROM messages q WHERE q.turn_id=u.id AND q.owner_id=u.owner_id AND q.role='assistant' ORDER BY q.created_at DESC,q.id DESC LIMIT 1)
          AND NOT ${laterSupersedingTurnSql}
        ORDER BY m.created_at DESC,m.id DESC LIMIT 1`,
-            [ownerId, thread.id, channel, options.replyToMessageId ?? null],
-          )
-        ).rows[0]
-      : undefined;
+              [ownerId, thread.id, channel, options.replyToMessageId ?? null],
+            )
+          ).rows[0]
+        : undefined;
     await client.query(
       `INSERT INTO turns(id,owner_id,thread_id,source,source_id,message_id,prompt,channel,session_id,background,parent_turn_id,status,finished_at,withdrawn)
        VALUES($1,$2,$3,'user',$4,$5,$6,$7,$8,$9,$10,$11,CASE WHEN $11='cancelled' THEN now() END,$11='cancelled')`,
@@ -805,7 +897,7 @@ export async function submitUserMessage(
     if (taskTarget) await taskTarget.record(turnId);
     const prepared = (await options.prepareAttachments?.(client, thread.id)) ?? [];
     await client.query(
-      "INSERT INTO messages(id,owner_id,role,text,display_text,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,audio_caption,question_answer) VALUES($1,$2,'user',$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+      "INSERT INTO messages(id,owner_id,role,text,display_text,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,audio_caption,question_answer,no_reply_context) VALUES($1,$2,'user',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
       [
         messageId,
         ownerId,
@@ -818,6 +910,7 @@ export async function submitUserMessage(
         options.replyQuote ?? null,
         options.audioCaption ?? null,
         options.questionAnswer ? JSON.stringify(options.questionAnswer) : null,
+        noReplyContext,
       ],
     );
     if (live) await sendDrain(client, thread.id);
@@ -1457,15 +1550,17 @@ async function takeQueuedMessages(turnId: string, sessionId: string, channel: st
   return transaction(async (client) => {
     const thread = await lockThread(client);
     const { rows } = await client.query(
-      `SELECT u.id,u.status,u.source,u.channel,u.message_id,u.prompt,to_jsonb(u)->>'task_id' AS task_id,(to_jsonb(u)->>'task_revision')::integer AS task_revision FROM turns u
+      `SELECT u.id,u.status,u.source,u.channel,u.message_id,u.prompt,EXISTS(SELECT 1 FROM messages m WHERE m.id=u.message_id AND m.owner_id=u.owner_id AND m.no_reply_context) AS no_reply_context,to_jsonb(u)->>'task_id' AS task_id,(to_jsonb(u)->>'task_revision')::integer AS task_revision FROM turns u
        WHERE u.thread_id=$1 AND u.owner_id=$2 AND u.session_id=$4 AND (u.status='queued' OR u.id=$3)
        ORDER BY u.created_at,u.id FOR UPDATE OF u`,
       [thread.id, ownerId, turnId, sessionId],
     );
     if (!rows.some((row) => row.id === turnId && row.status === 'running')) throw turnStopped();
+    if (rows.find((row) => row.id === turnId)?.no_reply_context) return [];
     const next = rows.find((row) => row.status === 'queued');
     if (
       !next ||
+      next.no_reply_context ||
       !['user', 'task'].includes(next.source) ||
       next.channel !== channel ||
       !next.message_id

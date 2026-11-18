@@ -31,6 +31,7 @@ interface Root {
 type AnswerScope =
   | { kind: 'legacy' }
   | { kind: 'refused' }
+  | { kind: 'fresh'; conversationId: string; threadId: string }
   | {
       kind: 'main';
       conversationId: string | null;
@@ -86,6 +87,10 @@ export async function createChannelRich(
     CREATE INDEX IF NOT EXISTS messages_main_answer ON messages(owner_id,turn_id,created_at DESC,id DESC) WHERE role='assistant';
     CREATE INDEX IF NOT EXISTS turns_main_answer_started ON turns(owner_id,session_id,started_at) WHERE started_at IS NOT NULL;`);
   const hasApprovals = (await pool.query("SELECT to_regclass('approvals') AS name")).rows[0]?.name;
+  if ((await pool.query("SELECT to_regclass('credential_requests') AS name")).rows[0]?.name)
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS credential_requests_reply_pending ON credential_requests(owner_id,turn_id) WHERE status='pending'",
+    );
   await pool.query(
     "UPDATE channel_roots SET state='uncertain',nonce=NULL WHERE owner_id=$1 AND state='preparing'",
     [options.ownerId],
@@ -259,6 +264,10 @@ export async function createChannelRich(
       )
     ).rows[0];
     if (conversation && !conversation.allowed) return { kind: 'refused' };
+    const unanswered = (): AnswerScope =>
+      purpose === 'ordinary' && conversation?.allowed
+        ? { kind: 'fresh', conversationId: conversation.id, threadId: conversation.thread_id }
+        : { kind: 'refused' };
     if (!conversation && !exactMessageId) return { kind: 'legacy' };
     const binding = conversation
       ? (
@@ -268,7 +277,7 @@ export async function createChannelRich(
           )
         ).rows[0]
       : undefined;
-    if (conversation && !binding) return { kind: 'refused' };
+    if (conversation && !binding) return unanswered();
     const row = (
       await database.query(
         `WITH latest AS MATERIALIZED (
@@ -280,7 +289,8 @@ export async function createChannelRich(
            EXISTS(SELECT 1 FROM threads th WHERE th.id=u.thread_id AND th.owner_id=$1 AND th.archived_at IS NULL) AS active,
            ${hasApprovals ? 'EXISTS(SELECT 1 FROM approvals a WHERE a.owner_id=$1 AND a.confirmation_message_id=m.id)' : 'false'} AS approval
          FROM latest m JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id
-         LEFT JOIN channel_outbox o ON o.message_id=m.id LEFT JOIN channel_inbox i ON i.source_id=o.source_id`,
+         LEFT JOIN channel_outbox o ON o.message_id=m.id
+         LEFT JOIN channel_inbox i ON i.source_id=o.source_id AND i.owner_id=m.owner_id AND i.provider='slack'`,
         [options.ownerId, binding?.turn_id ?? null, exactMessageId ?? null],
       )
     ).rows[0];
@@ -310,7 +320,7 @@ export async function createChannelRich(
           row.installation_id !== installation())) ||
       row.approval
     )
-      return { kind: 'refused' };
+      return unanswered();
     const current = (
       await database.query(
         `SELECT NOT ${laterSupersedingTurnSql} AS question_current,(${waitingTurnSql('u', 'credentials')}) AS credentials_current
@@ -342,7 +352,7 @@ export async function createChannelRich(
       row.status === 'succeeded' ||
       (row.status === 'waiting' && row.waiting_reason === 'question' && current.question_current)
     ))
-      return { kind: 'refused' };
+      return unanswered();
     if (!conversation && row.status === 'succeeded' && !current.question_current)
       return { kind: 'refused' };
     return {

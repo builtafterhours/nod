@@ -93,6 +93,7 @@ interface ChannelOptions {
     attachments?: Artifact[],
     onInserted?: () => void,
     stopSignal?: AbortSignal,
+    replyContext?: 'none',
   ) => Promise<string>;
   stopSignal?: () => AbortSignal;
   messageAccepted?: () => (channel: string) => void;
@@ -1225,12 +1226,15 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           ? providerExactQ
           : scope.kind === 'main'
             ? scope.messageId
-            : routedReplyToMessageId;
+            : scope.kind === 'fresh'
+              ? undefined
+              : routedReplyToMessageId;
       if (
         permitted(row) &&
         row.provider === 'slack' &&
         row.provider_reply_id &&
-        (!routedReplyToMessageId || (scope.kind === 'refused' && !answer))
+        ((!routedReplyToMessageId && scope.kind !== 'fresh') ||
+          (scope.kind === 'refused' && !answer))
       ) {
         const threadId = options.activeThread ? (await options.activeThread(client)).id : null;
         await saveReply(client, row.source_id, threadId, {
@@ -1311,20 +1315,44 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       }
       const messageId = row.message_id ?? randomUUID();
       let inserted = false;
-      const turnId = await options.submit(
-        row.text,
-        row.source_id,
-        client,
-        channel,
-        messageId,
-        retiredBeforeAnswer ? undefined : answer,
-        retiredBeforeAnswer ? undefined : replyToMessageId,
-        row.attachments ?? [],
-        () => {
-          inserted = true;
-        },
-        stopSignal,
-      );
+      const replyContext = scope.kind === 'fresh' && !answer ? 'none' : undefined;
+      if (replyContext) await client.query('SAVEPOINT channel_submission');
+      let turnId: string;
+      try {
+        turnId = await options.submit(
+          row.text,
+          row.source_id,
+          client,
+          channel,
+          messageId,
+          retiredBeforeAnswer ? undefined : answer,
+          retiredBeforeAnswer ? undefined : replyToMessageId,
+          row.attachments ?? [],
+          () => {
+            inserted = true;
+          },
+          stopSignal,
+          replyContext,
+        );
+        if (replyContext) await client.query('RELEASE SAVEPOINT channel_submission');
+      } catch (cause) {
+        if (
+          !replyContext ||
+          !(cause instanceof Error) ||
+          !('code' in cause) ||
+          cause.code !== 'reply_context_unavailable'
+        )
+          throw cause;
+        await client.query('ROLLBACK TO SAVEPOINT channel_submission');
+        await client.query('RELEASE SAVEPOINT channel_submission');
+        const threadId = options.activeThread ? (await options.activeThread(client)).id : null;
+        await saveReply(client, row.source_id, threadId, { text: cause.message });
+        await client.query(
+          "UPDATE channel_inbox SET state='discarded' WHERE source_id=$1 AND owner_id=$2",
+          [row.source_id, ownerId],
+        );
+        return true;
+      }
       await options.attributeMediaUsage?.(client, row.media_usage_ids ?? [], turnId);
       await client.query(
         "UPDATE channel_inbox SET state='submitted',turn_id=$2,message_id=$3,channel=$5 WHERE source_id=$1 AND owner_id=$4",
