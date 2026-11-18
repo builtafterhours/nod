@@ -633,6 +633,25 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     return mainTarget;
   }
 
+  async function routingOnlyReply(
+    identity: ChannelIdentity,
+    dm: string,
+    root: string | null | undefined,
+    target: string | undefined,
+  ) {
+    if (identity.provider !== 'slack' || !root || !target) return false;
+    if (!(await rich.resolveMain(identity, dm, root)).target) return false;
+    return Boolean(
+      (
+        await pool.query(
+          `SELECT 1 FROM messages m JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id
+           WHERE m.id=$1 AND m.owner_id=$2 AND m.role='user' AND u.session_id=u.thread_id`,
+          [target, ownerId],
+        )
+      ).rowCount,
+    );
+  }
+
   async function hiddenReplyTarget(database: Pool | PoolClient, messageId: string) {
     const result = await database.query<{ text: string }>(
       'SELECT text FROM messages WHERE id=$1 AND owner_id=$2 AND hidden_at IS NOT NULL',
@@ -869,6 +888,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           const target = replyToMessageId
             ? await nativeReply(identity, threadId, replyToMessageId, true)
             : undefined;
+          const routingOnly = await routingOnlyReply(identity, threadId, replyToMessageId, target);
           if (replyToMessageId && !target)
             throw Object.assign(new Error('The verification reply is unavailable.'), {
               statusCode: 409,
@@ -877,7 +897,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             clientMessageId: acceptedMessageId,
             channel: conversationChannel(identity),
             ...(mediaThreadId ? { threadId: mediaThreadId } : {}),
-            ...(target ? { replyToMessageId: target } : {}),
+            ...(target && !routingOnly ? { replyToMessageId: target } : {}),
             ...(recorded ? { receiptOnly: true } : {}),
             persistOrdinary: async (client) => {
               if (
@@ -1061,7 +1081,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const exactReply = pending.provider_reply_id
       ? await nativeReply(pending, pending.thread_id, pending.provider_reply_id, true)
       : undefined;
-    const replyToMessageId =
+    const routedReplyToMessageId =
       resolvedReply && pending.provider === 'slack'
         ? (
             await pool.query<{ id: string }>(
@@ -1070,8 +1090,16 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             )
           ).rows[0]?.id
         : resolvedReply;
-    const hiddenBeforeAnswer = replyToMessageId
-      ? await hiddenReplyTarget(pool, replyToMessageId)
+    const replyToMessageId = (await routingOnlyReply(
+      pending,
+      pending.thread_id,
+      pending.provider_reply_id,
+      routedReplyToMessageId,
+    ))
+      ? undefined
+      : routedReplyToMessageId;
+    const hiddenBeforeAnswer = routedReplyToMessageId
+      ? await hiddenReplyTarget(pool, routedReplyToMessageId)
       : undefined;
     const retiredBeforeAnswer =
       hiddenBeforeAnswer && replyToMessageId && options.isRetirableScheduleConfirmation
@@ -1123,7 +1151,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         permitted(row) &&
         row.provider === 'slack' &&
         row.provider_reply_id &&
-        !replyToMessageId
+        !routedReplyToMessageId
       ) {
         const threadId = options.activeThread ? (await options.activeThread(client)).id : null;
         await saveReply(client, row.source_id, threadId, {
@@ -1148,8 +1176,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         );
         return false;
       }
-      const hiddenNow = replyToMessageId
-        ? await hiddenReplyTarget(client, replyToMessageId)
+      const hiddenNow = routedReplyToMessageId
+        ? await hiddenReplyTarget(client, routedReplyToMessageId)
         : undefined;
       if (Boolean(hiddenNow) !== Boolean(hiddenBeforeAnswer)) throw replyTargetChanged;
       if (hiddenNow && retiredBeforeAnswer && !command && retiredAnswer === 'uncertain') {
