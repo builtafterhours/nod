@@ -602,8 +602,12 @@ function assertReplyContext(options: SubmitUserMessageOptions) {
 }
 
 async function assertFreshRequest(client: PoolClient, threadId: string) {
-  const candidates = await client.query(
-    `WITH candidates AS MATERIALIZED (
+  const unavailable = (
+    message = 'Nod is waiting for an answer. Reply to the current question or send a new direct message.',
+  ) => Object.assign(httpError(message, 409), { code: 'reply_context_unavailable' });
+  const candidates = await client
+    .query(
+      `WITH candidates AS MATERIALIZED (
        (SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2 AND status='running' ORDER BY id LIMIT 2)
        UNION (SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2
          AND NOT (status='succeeded' AND started_at IS NULL AND message_id IS NOT NULL AND source IN ('user','task'))
@@ -612,12 +616,16 @@ async function assertFreshRequest(client: PoolClient, threadId: string) {
        UNION (SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2 AND status='waiting' AND waiting_reason='credentials' AND started_at IS NULL
          ORDER BY created_at DESC,id DESC LIMIT 1))
      SELECT u.id,u.status,u.waiting_reason,u.created_at::text,u.started_at::text FROM turns u JOIN candidates c ON c.id=u.id
-     WHERE u.owner_id=$1 AND u.thread_id=$2 ORDER BY u.id FOR NO KEY UPDATE OF u`,
-    [ownerId, threadId],
-  );
-  const unavailable = (
-    message = 'Nod is waiting for an answer. Reply to the current question or send a new direct message.',
-  ) => Object.assign(httpError(message, 409), { code: 'reply_context_unavailable' });
+     WHERE u.owner_id=$1 AND u.thread_id=$2 ORDER BY u.id FOR NO KEY UPDATE OF u NOWAIT`,
+      [ownerId, threadId],
+    )
+    .catch((cause: unknown) => {
+      if (cause instanceof Error && 'code' in cause && cause.code === '55P03')
+        throw unavailable(
+          'Nod is busy with the current request. Try your new request again shortly.',
+        );
+      throw cause;
+    });
   if (candidates.rows.filter((row) => row.status === 'running').length > 1)
     throw unavailable(
       'Nod cannot safely start a new request while more than one turn is running in this conversation.',
