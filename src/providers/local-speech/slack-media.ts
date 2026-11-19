@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 const rate = 16_000;
 const maxPcmBytes = 300 * rate * 2;
@@ -50,11 +50,15 @@ export async function prepareSlackSpeech(
   else throw new LocalMediaDecodeError('format');
   signal.throwIfAborted();
   let executable: string | undefined;
-  for (const candidate of [
-    '/opt/homebrew/bin/ffmpeg',
-    '/usr/local/bin/ffmpeg',
-    '/usr/bin/ffmpeg',
-  ]) {
+  const candidates =
+    process.platform === 'win32'
+      ? (process.env.PATH ?? '')
+          .split(delimiter)
+          .map((entry) => entry.replace(/^"|"$/g, '').trim())
+          .filter((entry) => /^[a-z]:[\\/]/i.test(entry))
+          .map((entry) => join(entry, 'ffmpeg.exe'))
+      : ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'];
+  for (const candidate of candidates) {
     if (
       await access(candidate, constants.X_OK).then(
         () => true,
@@ -117,7 +121,10 @@ export async function prepareSlackSpeech(
           ],
           {
             stdio: [file.fd, 'pipe', 'pipe'],
-            env: { LANG: 'C' },
+            env: {
+              LANG: 'C',
+              ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot } : {}),
+            },
             signal: operation,
             killSignal: 'SIGKILL',
             windowsHide: true,

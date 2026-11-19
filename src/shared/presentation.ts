@@ -626,7 +626,7 @@ export function presentationText(value: Presentation, tables = false) {
   }
   for (const source of value.sources)
     lines.push(
-      tables && !/[\n\r\\[\]]/.test(source.label)
+      tables && !/[\n\r\\[\]*_~`<>]/.test(source.label)
         ? `[${source.label}](${source.url})`
         : `${source.label}: ${source.url}`,
     );

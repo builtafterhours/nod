@@ -263,7 +263,7 @@ process.on('message', async (raw: unknown) => {
           Array.isArray(result) ? result.map((part) => part.text).join(' ') : result.text
         ).trim();
         if (!text) throw new Error('silence');
-        if (text.length > 100_000) throw new Error('length');
+        if (text.length > 100_000) throw new Error('transcript_length');
         process.send!({ id: message.id, type: 'text', text });
       } else if (
         message.method === 'synthesize' &&
@@ -281,7 +281,8 @@ process.on('message', async (raw: unknown) => {
       id: message.id,
       type: 'failed',
       reason:
-        error instanceof Error && ['format', 'length', 'silence', 'tokens'].includes(error.message)
+        error instanceof Error &&
+        ['format', 'length', 'silence', 'tokens', 'transcript_length'].includes(error.message)
           ? error.message
           : 'failed',
       ...(message.method === 'prepare'

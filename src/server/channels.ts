@@ -609,9 +609,9 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     database: Pool | PoolClient = pool,
   ) {
     if (identity.provider !== 'slack' || !root) return { kind: 'legacy' } as const;
-    const task = await rich.resolve(identity, dm, root);
+    const task = await rich.resolve(identity, dm, root, database);
     if (task.known) return { kind: 'legacy' } as const;
-    const main = await rich.resolveMain(identity, dm, root);
+    const main = await rich.resolveMain(identity, dm, root, database);
     if (!main.known && (!identity.installation_id || !identity.canonical_root_id))
       return { kind: 'legacy' } as const;
     return rich.resolveAnswer(database, identity, dm, root, purpose, exactMessageId);

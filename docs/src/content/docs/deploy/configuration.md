@@ -160,7 +160,7 @@ For QR setup, use **Channels** to scan the code. The `bot` and `self-chat` modes
 
 The smallest Telegram configuration needs `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID`; it uses polling.
 
-Slack requires both tokens, the workspace ID, and your member ID. Enable Socket Mode, the bot scopes, and the three events listed in [Slack setup](/use/channels/#slack-setup). Nod verifies the bot, app, workspace, member, and DM again when the connection starts. No public callback, signing secret, workspace slash command, or `chat:write.public` permission is needed. Use `nod usage`, `nod memory`, `nod tasks`, `nod status`, and `nod stop` as ordinary DM text.
+Slack requires both tokens, the workspace ID, and your member ID. Enable Socket Mode, the bot scopes, and the three events listed in [Slack setup](/use/channels/#slack-setup). Nod verifies the bot, app, workspace, member, and DM again when the connection starts. No public callback, signing secret, workspace slash command, or `chat:write.public` permission is needed. Send commands as ordinary DM text. See [Slack replies and commands](/use/channels/#slack-replies-and-commands) for which commands are scoped to a task thread.
 
 ### Telegram webhooks
 

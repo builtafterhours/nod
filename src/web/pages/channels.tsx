@@ -268,7 +268,7 @@ function ChannelCard({
   const retrying =
     (setup?.mode === 'linked' &&
       (setup.connectionState === 'connecting' || setup.connectionState === 'disconnected')) ||
-    (provider.id === 'slack' && available === false && !error);
+    (provider.id === 'slack' && configured && available === false && !error);
   const status: keyof typeof channelStatus | null = connected
     ? retrying
       ? 'connecting'

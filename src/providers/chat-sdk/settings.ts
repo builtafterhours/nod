@@ -3,6 +3,7 @@ import { isIP } from 'node:net';
 import { z } from 'zod';
 import { modelServiceError } from '../model-error.ts';
 import { slackInput, verifySlack } from './slack.ts';
+import { MessagingConnectionError } from '../../ports/messaging.ts';
 import {
   ChannelSetupFailure,
   telegramSecret,
@@ -263,7 +264,7 @@ export function createChatSdkSetupVerifier(
         };
       } catch (error) {
         if (error instanceof ChannelSetupFailure) throw error;
-        if (provider === 'slack' && error instanceof Error)
+        if (provider === 'slack' && error instanceof MessagingConnectionError)
           throw new ChannelSetupFailure('verification_failed', error.message);
         throw new ChannelSetupFailure('verification_failed');
       }

@@ -1312,9 +1312,10 @@ export async function createChannelRich(
       identity: { account_id: string; sender_id: string },
       dm: string,
       root: string,
+      database: Pick<Pool, 'query'> = pool,
     ) {
       const result = (
-        await pool.query<{ target_id: string; allowed: boolean }>(
+        await database.query<{ target_id: string; allowed: boolean }>(
           `SELECT c.target_id,(c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.installation_id=$6 AND th.archived_at IS NULL) AS allowed
          FROM channel_main_conversations c JOIN threads th ON th.id=c.thread_id AND th.owner_id=c.owner_id
          WHERE c.owner_id=$1 AND c.root_id=$5 ORDER BY (c.account_id=$2 AND c.sender_id=$3 AND c.dm=$4 AND c.installation_id=$6) DESC LIMIT 1`,
@@ -1371,9 +1372,14 @@ export async function createChannelRich(
         )
       ).rows[0];
     },
-    async resolve(identity: { account_id: string; sender_id: string }, dm: string, root: string) {
+    async resolve(
+      identity: { account_id: string; sender_id: string },
+      dm: string,
+      root: string,
+      database: Pick<Pool, 'query'> = pool,
+    ) {
       const row = (
-        await pool.query<{ target_id: string; allowed: boolean }>(
+        await database.query<{ target_id: string; allowed: boolean }>(
           `SELECT r.target_id,(r.account_id=$2 AND r.sender_id=$3 AND r.dm=$4 AND r.state='open' AND th.archived_at IS NULL
             AND r.session_id<>r.thread_id AND t.state='open') AS allowed
            FROM channel_roots r JOIN threads th ON th.id=r.thread_id AND th.owner_id=r.owner_id

@@ -86,9 +86,16 @@ export function createChannelMedia(options: {
               undefined,
               error.httpStatus,
               error.serviceCode,
+              error,
             );
           throw slack
-            ? new ChannelMediaFailure('attachment_read_failed')
+            ? new ChannelMediaFailure(
+                'attachment_read_failed',
+                undefined,
+                undefined,
+                undefined,
+                error,
+              )
             : new ChannelMediaFailure('unavailable', undefined, undefined, undefined, error);
         }
         signal.throwIfAborted();

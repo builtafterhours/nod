@@ -752,6 +752,7 @@ export function createSlackTransport(
             if (!current()) return;
             channel.available = false;
             replacementNeeded = true;
+            nextAttempt = Math.max(nextAttempt, Date.now() + 2000);
           });
           candidate.on('nod_start_failed', (error) => {
             if (!current()) return;
@@ -972,7 +973,12 @@ export function createSlackTransport(
               'user_not_found',
             ].includes(error.data.error)
           ) {
-            streamUnsupported = true;
+            streamUnsupported = [
+              'missing_scope',
+              'not_allowed_token_type',
+              'deprecated_endpoint',
+              'method_deprecated',
+            ].includes(error.data.error);
             await input.stream.record({ part, state: 'uncertain' });
             streamError = `Streaming unavailable. ${failure(error).message}`;
             updateRichError();

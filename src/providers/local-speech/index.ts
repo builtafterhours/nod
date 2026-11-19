@@ -201,7 +201,9 @@ export function createLocalSpeechProvider(options: {
               : new SpeechProviderError(
                   reply.reason === 'tokens'
                     ? "This text exceeds the local voice's pronunciation limit. Try a shorter passage or a voice service that supports its language."
-                    : 'Local speech failed. Try again.',
+                    : reply.reason === 'transcript_length'
+                      ? 'Local speech produced an unusually long transcript. Try recording again.'
+                      : 'Local speech failed. Try again.',
                 ),
           );
         }

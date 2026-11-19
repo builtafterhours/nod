@@ -56,7 +56,7 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
   const [connectionDirty, setConnectionDirty] = useState(false);
   const [discardConnection, setDiscardConnection] = useState(false);
   const [error, setError] = useState('');
-  const [preparationError, setPreparationError] = useState('');
+  const [preparationErrors, setPreparationErrors] = useState({ voice: '', input: '' });
   const [preparing, setPreparing] = useState<'voice' | 'input' | null>(null);
   const [catalogRefreshing, setCatalogRefreshing] = useState(false);
   const [catalogError, setCatalogError] = useState('');
@@ -146,7 +146,7 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
     const controller = new AbortController();
     prepareRequest.current = controller;
     setPreparing(target);
-    setPreparationError('');
+    setPreparationErrors((current) => ({ ...current, [target]: '' }));
     try {
       await api('/api/speech/prepare', {
         method: 'POST',
@@ -159,7 +159,8 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
       controller.signal.throwIfAborted();
       update(() => next);
     } catch (cause) {
-      if (!controller.signal.aborted) setPreparationError(errorMessage(cause));
+      if (!controller.signal.aborted)
+        setPreparationErrors((current) => ({ ...current, [target]: errorMessage(cause) }));
     } finally {
       if (prepareRequest.current === controller) {
         prepareRequest.current = null;
@@ -376,14 +377,14 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
                 value={data.speechVoice}
                 defaultVoice={data.defaultVoice}
                 open={pickerOpen}
-                disabled={saving || connectionBusy}
+                disabled={saving || connectionBusy || preparing === 'input'}
                 labelledBy={`${id}-voice`}
                 loading={previewing}
                 playing={playing}
                 error={error || catalogError || data.voicesError || ''}
                 local={data.local}
                 preparing={preparing === 'voice'}
-                preparationError={preparationError}
+                preparationError={preparationErrors.voice}
                 refreshing={catalogRefreshing}
                 providers={providerOptions}
                 onOpenChange={(open) => {
@@ -479,9 +480,9 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
               </div>
             </div>
           )}
-          {!pickerOpen && preparationError && (
+          {preparationErrors.input && (
             <p className="field-hint" role="alert">
-              {preparationError}
+              {preparationErrors.input}
             </p>
           )}
           <div className="account-preference-row voice-spoken-row">
@@ -514,9 +515,9 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
         !loadError && <p className="field-hint">Loading voices…</p>
       )}
       {!pickerOpen &&
-        (loadError || error || catalogError || data?.voicesError || preparationError) && (
+        (loadError || error || catalogError || data?.voicesError || preparationErrors.voice) && (
           <Notice>
-            {loadError || error || catalogError || data?.voicesError || preparationError}
+            {loadError || error || catalogError || data?.voicesError || preparationErrors.voice}
             {(loadError || catalogError || data?.voicesError) && (
               <Button
                 type="button"

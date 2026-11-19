@@ -55,6 +55,7 @@
     "@pedrobef/vozz": "0.2.7",
     "@sinclair/typebox": "^0.34.41",
     "@slack/socket-mode": "3.2.0",
+    "@slack/types": "3.3.0",
     "@slack/web-api": "8.4.0",
     "@spelling-creator/spellophone": "0.2.1",
     "@whiskeysockets/baileys": "7.0.0-rc14",
