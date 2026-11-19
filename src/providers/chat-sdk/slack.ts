@@ -596,10 +596,11 @@ export function createSlackTransport(
 
   function attachment(file: z.infer<typeof fileSchema>): MessagingAttachment {
     const extension = /^[a-z0-9]{1,16}$/.test(file.filetype ?? '') ? `.${file.filetype}` : '';
+    const clip = /^(?:audio|video)\//.test(file.mimetype);
     return {
       name: file.name ?? `file-${file.id}${extension}`,
       mimeType: file.mimetype,
-      size: file.size,
+      size: clip ? 0 : file.size,
       ...(file.mimetype.startsWith('audio/') ? { voice: true } : {}),
       async read(signal) {
         signal?.throwIfAborted();
@@ -619,10 +620,14 @@ export function createSlackTransport(
             redirect: 'error',
             signal: operation,
           });
-          if (!response.ok || !response.body)
+          if (response.status !== 200 || response.headers.has('content-range') || !response.body) {
+            await response.body?.cancel().catch(() => {});
             throw new MessagingAttachmentReadError('download_http_error', response.status);
-          if (Number(response.headers.get('content-length') ?? 0) > fileLimit) {
-            await response.body.cancel();
+          }
+          const length = response.headers.get('content-length');
+          const expectedSize = length === null ? undefined : Number(length);
+          if (expectedSize !== undefined && expectedSize > fileLimit) {
+            await response.body.cancel().catch(() => {});
             throw new MessagingAttachmentError(fileLimit);
           }
           const reader = response.body.getReader();
@@ -641,6 +646,13 @@ export function createSlackTransport(
             await reader.cancel().catch(() => {});
             reader.releaseLock();
           }
+          const encoding = response.headers.get('content-encoding')?.toLowerCase();
+          if (
+            expectedSize !== undefined &&
+            (!encoding || encoding === 'identity') &&
+            size !== expectedSize
+          )
+            throw new MessagingAttachmentReadError('download_failed');
           return Buffer.concat(chunks);
         } catch (error) {
           signal?.throwIfAborted();
