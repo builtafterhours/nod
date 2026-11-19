@@ -1045,6 +1045,39 @@ export function createSlackTransport(
             updateRichError();
             return {};
           }
+          if (!input.task && input.status === 'active' && !input.outcome) {
+            if (input.current && !(await input.current())) return {};
+            if (previous?.provider_id) {
+              try {
+                const deleted = await viewWeb.chat.delete({
+                  channel: dm,
+                  ts: messageId(previous.provider_id),
+                });
+                const warning = deleted.warning || deleted.response_metadata?.warnings?.[0];
+                if (warning)
+                  throw new MessagingConnectionError(
+                    `Slack failed: ${/^[a-z_]{1,80}$/.test(warning) ? warning : 'control_delete_warning'}.`,
+                  );
+                if (deleted.ts !== messageId(previous.provider_id))
+                  throw new MessagingConnectionError(
+                    'Slack failed: control_delete_receipt_unavailable.',
+                  );
+              } catch (error) {
+                if (
+                  !(error instanceof WebAPIPlatformError) ||
+                  error.data.error !== 'message_not_found'
+                )
+                  throw error;
+              }
+              await pool.query(
+                'DELETE FROM channel_slack_views WHERE installation=$1 AND session_id=$2 AND root_id=$3 AND provider_id=$4',
+                [key, input.sessionId, input.rootMessageId, previous.provider_id],
+              );
+            }
+            viewError = undefined;
+            updateRichError();
+            return {};
+          }
           const header = [
             input.title,
             (input.task ? 'Overall task: ' : '') +
@@ -1462,7 +1495,7 @@ export function createSlackTransport(
                   error instanceof WebAPIPlatformError &&
                   !('ts' in error.data) &&
                   !('message' in error.data) &&
-                  !error.data.warning &&
+                  !('warning' in error.data) &&
                   !error.data.response_metadata?.warnings?.length &&
                   ['invalid_blocks', 'invalid_blocks_format'].includes(error.data.error)
                 ) {
