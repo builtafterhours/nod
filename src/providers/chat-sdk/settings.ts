@@ -9,6 +9,7 @@ import {
   telegramSecret,
   type ChannelSetupVerifier,
 } from '../../ports/channel-settings.ts';
+import { telegramUpdateTypes } from './telegram.ts';
 
 const webhookUrl = z.url().max(2048).optional();
 const telegramInput = z
@@ -291,7 +292,7 @@ export function createChatSdkSetupVerifier(
             body: JSON.stringify({
               url: webhookEndpoint,
               secret_token: secret,
-              allowed_updates: ['message', 'message_reaction'],
+              allowed_updates: telegramUpdateTypes,
               drop_pending_updates: false,
             }),
           },

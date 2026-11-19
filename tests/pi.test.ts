@@ -19,6 +19,7 @@ import {
   createAgentSession,
   SessionManager,
   ModelRuntime,
+  type ProviderModelConfig,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import {
@@ -9301,6 +9302,10 @@ test('each session opens on its work model and the observer starts fresh after a
     },
   });
   const catalog = await backend.catalog('openai', 'api_key');
+  const { modelPricingSignature } = await import('../src/shared/models.ts');
+  const luna = catalog.find((item) => item.choice.id === 'gpt-6-luna')!;
+  const signatures: Array<string | undefined> = [];
+  const auxiliary: ProviderUsageEvent[] = [];
   const directory = await mkdtemp(join(tmpdir(), 'nod-work-model-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const chosen: Array<string | undefined> = [];
@@ -9320,6 +9325,37 @@ test('each session opens on its work model and the observer starts fresh after a
     sessionRoot: directory,
     createSession: async (options) => {
       const result = await createAgentSession(options);
+      if (options?.model?.id === 'gpt-6.1-sol') {
+        assert.ok(options.modelRuntime);
+        options.modelRuntime.registerProvider('openai', {
+          models: [options.model, luna.spec] as ProviderModelConfig[],
+        });
+      }
+      const subscribe = result.session.subscribe.bind(result.session);
+      result.session.subscribe = (listener) =>
+        subscribe((event) => {
+          listener(event);
+          if (
+            event.type !== 'message_end' ||
+            event.message.role !== 'assistant' ||
+            event.message.model !== 'gpt-6.1-sol'
+          )
+            return;
+          const entry = result.session.sessionManager.appendUsage(
+            'auxiliary',
+            'openai',
+            'gpt-6-luna',
+            {
+              input: 3,
+              output: 2,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 5,
+              cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
+            },
+          );
+          listener({ type: 'entry_appended', entry });
+        });
       result.session.agent.streamFunction = (model, context) => {
         requests.push({ model: model.id, history: JSON.stringify(context.messages) });
         const stream = createAssistantMessageEventStream();
@@ -9358,7 +9394,11 @@ test('each session opens on its work model and the observer starts fresh after a
       ...sandbox,
       tools: [],
       shouldStop: () => false,
-      onEvent() {},
+      onEvent(event) {
+        if (event.type === 'model_usage') signatures.push(event.pricingSignature);
+        if (event.type === 'provider_usage' && event.usage.operation === 'auxiliary')
+          auxiliary.push(event.usage);
+      },
     });
     await session.prompt(prompt, []);
     await session.dispose();
@@ -9371,6 +9411,25 @@ test('each session opens on its work model and the observer starts fresh after a
   assert.deepEqual(
     requests.map((request) => request.model),
     ['gpt-6-luna', 'gpt-6-luna', 'gpt-6.1-sol', 'gpt-6.1-sol'],
+  );
+  assert.equal(signatures.length, requests.length);
+  for (const [index, { model }] of requests.entries()) {
+    const cost = catalog.find((item) => item.choice.id === model)!.spec
+      .cost as import('../src/shared/models.ts').ModelPricing;
+    const expected = modelPricingSignature(cost);
+    assert.ok(expected);
+    assert.equal(signatures[index], expected);
+  }
+  assert.equal(auxiliary.length, 2);
+  const auxiliaryPricing = modelPricingSignature(
+    luna.spec.cost as import('../src/shared/models.ts').ModelPricing,
+    luna.spec.api,
+  );
+  assert.ok(auxiliaryPricing);
+  assert.notEqual(auxiliaryPricing, signatures[2]);
+  assert.deepEqual(
+    auxiliary.map(({ pricingSignature }) => pricingSignature),
+    [auxiliaryPricing, auxiliaryPricing],
   );
   assert.ok(requests[1]!.history.includes('Synthetic first batch'));
   assert.ok(!requests[2]!.history.includes('Synthetic second batch'));
@@ -10032,6 +10091,23 @@ test('failed model requests keep unknown costs and remain separate from their re
   assert.equal(cancelled?.costUsd, null);
   assert.equal(observe({ ...failed, stopReason: 'stop' })?.costUsd, null);
   assert.equal(observe(succeeded)?.costUsd, 0.3);
+  for (const [cacheWrite1h, expected] of [
+    [6, 6],
+    [0, undefined],
+    [undefined, undefined],
+    [9, undefined],
+  ] as const) {
+    const cached = observe({
+      ...succeeded,
+      provider: 'anthropic',
+      api: 'anthropic-messages',
+      model: 'fixture-cache',
+      usage: { ...succeeded.usage, cacheWrite: 8, cacheWrite1h, totalTokens: 23 },
+    });
+    assert.ok(cached);
+    assert.equal(cached.cacheWriteTokens, 8);
+    assert.equal(cached.cacheWrite1hTokens, expected);
+  }
   const reports: Array<Partial<ProviderUsageEvent>> = [];
   let calls = 0;
   const runtime = {

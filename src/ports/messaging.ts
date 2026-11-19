@@ -145,6 +145,16 @@ export interface MessagingConversation {
   current?(): Promise<boolean>;
 }
 
+export interface InboundApproval {
+  channelId: string;
+  accountId: string;
+  senderId: string;
+  threadId: string;
+  messageId: string;
+  approved: boolean;
+  acknowledge(result: 'recorded' | 'unavailable' | 'retry'): Promise<void>;
+}
+
 export interface ChannelPairingRequest {
   channelId: string;
   accountId: string;
@@ -171,6 +181,7 @@ export interface MessagingWebhookResult {
   contentType?: string;
   messages?: InboundMessage[];
   reactions?: InboundReaction[];
+  approvals?: InboundApproval[];
   pairing?: ChannelPairingRequest;
 }
 
@@ -186,6 +197,7 @@ export interface MessagingTransport {
     accept: (message: InboundMessage) => Promise<void>,
     pair?: (request: ChannelPairingRequest) => Promise<void>,
     react?: (reaction: InboundReaction) => Promise<void>,
+    approve?: (approval: InboundApproval) => Promise<void>,
   ): Promise<void>;
   receive(request: MessagingWebhook): Promise<MessagingWebhookResult>;
   post(input: {
@@ -193,6 +205,7 @@ export interface MessagingTransport {
     accountId: string;
     threadId: string;
     text: string;
+    approval?: true;
     attachments?: MessagingAttachment[];
     replyToMessageId?: string;
     replyToText?: string;
@@ -216,7 +229,7 @@ export interface MessagingTransport {
       }): Promise<void>;
     };
     signal?: AbortSignal;
-  }): Promise<{ id: string; ids?: string[] }>;
+  }): Promise<{ id: string; ids?: string[]; approvalButtons?: true }>;
   react?(input: {
     channelId: string;
     accountId: string;

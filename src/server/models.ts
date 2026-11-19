@@ -37,6 +37,7 @@ import {
   modelSource,
   openAIRegions,
   routeModel,
+  supportsLongCacheWrites,
 } from '../shared/models.ts';
 import { signInPage } from '../shared/sign-in-page.ts';
 import { appPages } from '../shared/app-links.ts';
@@ -77,23 +78,29 @@ export const modelSelectionInput = z
   .strict();
 class ConnectionError extends ModelRequestError {}
 
+const rates = {
+  input: z.number().finite(),
+  output: z.number().finite(),
+  cacheRead: z.number().finite().optional(),
+  cacheWrite: z.number().finite().optional(),
+};
+const modelRates = z.object({
+  ...rates,
+  tiers: z.array(z.object({ ...rates, inputTokensAbove: z.number().nonnegative() })).optional(),
+});
+
 function modelPricing(model: ModelDefinition): ModelChoice['pricing'] {
+  if (model.spec.provider === 'compatible') return undefined;
   if (model.choice.id === 'openrouter/auto') return 'variable';
-  const cost = z
-    .object({
-      input: z.number().finite(),
-      output: z.number().finite(),
-      cacheRead: z.number().finite().optional(),
-      cacheWrite: z.number().finite().optional(),
-    })
-    .safeParse(model.spec.cost).data;
+  const cost = modelRates.safeParse(model.spec.cost).data;
   if (!cost) return undefined;
-  if (Object.values(cost).some((value) => value < 0)) return 'variable';
+  const { tiers, ...rates } = cost;
+  if ([rates, ...(tiers ?? [])].some((rate) => Object.values(rate).some((value) => value < 0)))
+    return 'variable';
   return {
-    input: cost.input,
-    output: cost.output,
-    ...(cost.cacheRead !== undefined ? { cacheRead: cost.cacheRead } : {}),
-    ...(cost.cacheWrite !== undefined ? { cacheWrite: cost.cacheWrite } : {}),
+    ...rates,
+    ...(tiers?.length ? { tiers } : {}),
+    ...(supportsLongCacheWrites(model.spec.api) ? { longCacheWrites: true } : {}),
   };
 }
 
@@ -1198,11 +1205,27 @@ export function createModelService(options: {
     },
     light: lightModel,
     unpricedPreparationModel,
+    pricingThresholds() {
+      return rows.flatMap(({ models }) =>
+        models.flatMap((model) => {
+          const pricing = modelPricing(model);
+          return pricing && pricing !== 'variable'
+            ? (pricing.tiers?.map((tier) => tier.inputTokensAbove) ?? [])
+            : [];
+        }),
+      );
+    },
     priceOf(choice: ModelSelection | null | undefined) {
-      const definition = rows
-        .find((row) => row.id === choice?.connectionId)
-        ?.models.find((model) => model.choice.id === choice?.modelId);
-      return definition && { modelId: definition.choice.id, pricing: modelPricing(definition) };
+      const row = rows.find((row) => row.id === choice?.connectionId);
+      const definition = row?.models.find((model) => model.choice.id === choice?.modelId);
+      return (
+        definition && {
+          modelId: definition.choice.id,
+          pricing: modelPricing(definition),
+          audio: definition.choice.audio,
+          plan: row?.method === 'subscription',
+        }
+      );
     },
     pricing(kind: WorkKind, own: ModelSelection | null = null) {
       return service.priceOf(
