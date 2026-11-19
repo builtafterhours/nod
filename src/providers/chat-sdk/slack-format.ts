@@ -63,7 +63,20 @@ function literal(source: string): SlackPart[] {
 }
 
 const linkable = (url: string) =>
-  /^(?:https?:\/\/|mailto:|tel:)[^\s()]+$/.test(url) && !/&(?:#|[a-z][a-z0-9]*;)/i.test(url);
+  /^(?:https?:\/\/|mailto:|tel:)[^\s()<>"`\\{}|^]+$/.test(url) &&
+  !/&(?:#|[a-z][a-z0-9]*;)/i.test(url);
+
+const host = (url: string) => {
+  try {
+    return /^https?:\/\//.test(url) ? new URL(url).host : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const seen = (text: string) => {
+  const match = /^https?:\/\/[^\s)]+/.exec(text)?.[0];
+  return match ? host(match) : undefined;
+};
 
 function exact(node: Node, source: string) {
   const parents = new Set(['paragraph', 'heading', 'tableCell', 'strong', 'emphasis', 'delete']);
@@ -224,7 +237,7 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
       if (node.type === 'link' && !source.startsWith('[', start(node))) {
         const raw = source.slice(start(node), end(node));
         return [
-          /^https?:\/\//.test(raw) && node.url === raw && linkable(raw)
+          node.url === raw && linkable(raw) && seen(source.slice(start(node))) === host(raw)
             ? { text: raw, url: raw, style, end: end(node) }
             : { text: raw, style, from: start(node), end: end(node) },
         ];
