@@ -262,7 +262,8 @@ process.on('message', async (raw: unknown) => {
         const text = (
           Array.isArray(result) ? result.map((part) => part.text).join(' ') : result.text
         ).trim();
-        if (!text || text.length > 100_000) throw new Error('format');
+        if (!text) throw new Error('silence');
+        if (text.length > 100_000) throw new Error('length');
         process.send!({ id: message.id, type: 'text', text });
       } else if (
         message.method === 'synthesize' &&

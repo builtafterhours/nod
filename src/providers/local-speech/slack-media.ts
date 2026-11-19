@@ -8,6 +8,11 @@ const rate = 16_000;
 const maxPcmBytes = 300 * rate * 2;
 
 export class LocalMediaDecoderMissing extends Error {}
+export class LocalMediaDecodeError extends Error {
+  constructor(readonly reason: 'decode' | 'length' | 'format') {
+    super('Local media conversion failed.');
+  }
+}
 
 export async function prepareSlackSpeech(
   input: { bytes: Uint8Array; mimeType: string; name: string },
@@ -15,8 +20,34 @@ export async function prepareSlackSpeech(
 ) {
   const mime = input.mimeType.split(';', 1)[0].trim().toLowerCase();
   const video = mime.startsWith('video/');
-  const mov = /^(audio\/(mp4|m4a|x-m4a)|video\/(mp4|quicktime))$/.test(mime);
-  if (!mov && mime !== 'video/webm') return video ? null : { ...input, mimeType: mime };
+  const header = Buffer.from(
+    input.bytes.buffer,
+    input.bytes.byteOffset,
+    Math.min(12, input.bytes.length),
+  );
+  let format: 'mov' | 'matroska' | 'aac';
+  if (/^(ftyp|moov|mdat|wide|free)$/.test(header.toString('ascii', 4, 8))) format = 'mov';
+  else if (header.length >= 4 && header.readUInt32BE(0) === 0x1a45dfa3) format = 'matroska';
+  else if (header[0] === 0xff && (header[1] & 0xf6) === 0xf0) format = 'aac';
+  else if (!video && header.toString('ascii', 0, 4) === 'OggS')
+    return { ...input, mimeType: 'audio/ogg' };
+  else if (
+    !video &&
+    header.toString('ascii', 0, 4) === 'RIFF' &&
+    header.toString('ascii', 8, 12) === 'WAVE'
+  )
+    return { ...input, mimeType: 'audio/wav' };
+  else if (/^(audio\/(mp4|m4a|x-m4a)|video\/(mp4|quicktime))$/.test(mime)) format = 'mov';
+  else if (mime === 'audio/webm' || mime === 'video/webm') format = 'matroska';
+  else if (/^audio\/(aac|x-aac|aacp)$/.test(mime)) format = 'aac';
+  else if (video) return null;
+  else if (
+    ['audio/ogg', 'audio/opus', 'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav'].includes(
+      mime,
+    )
+  )
+    return { ...input, mimeType: mime };
+  else throw new LocalMediaDecodeError('format');
   signal.throwIfAborted();
   let executable: string | undefined;
   for (const candidate of [
@@ -34,7 +65,10 @@ export async function prepareSlackSpeech(
       break;
     }
   }
-  if (!executable) throw new LocalMediaDecoderMissing();
+  if (!executable) {
+    if (!video && format === 'matroska') return { ...input, mimeType: 'audio/webm' };
+    throw new LocalMediaDecoderMissing();
+  }
   const operation = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
   const directory = await mkdtemp(join(tmpdir(), 'nod-slack-audio-'));
   try {
@@ -62,8 +96,8 @@ export async function prepareSlackSpeech(
             '-fd',
             '0',
             '-f',
-            mov ? 'mov' : 'matroska',
-            ...(mov ? ['-enable_drefs', '0', '-use_absolute_path', '0'] : []),
+            format,
+            ...(format === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0'] : []),
             '-threads',
             '1',
             '-i',
@@ -111,8 +145,8 @@ export async function prepareSlackSpeech(
         /^Stream map '(?:0:a:0)?' matches no streams\.$/m.test(stderr)
       )
         return null;
-      if (exit !== 0 || size < 2 || size > maxPcmBytes || size % 2)
-        throw new Error('Local media conversion failed.');
+      if (size > maxPcmBytes) throw new LocalMediaDecodeError('length');
+      if (exit !== 0 || size < 2 || size % 2) throw new LocalMediaDecodeError('decode');
       const header = Buffer.alloc(44);
       header.write('RIFF', 0);
       header.writeUInt32LE(size + 36, 4);

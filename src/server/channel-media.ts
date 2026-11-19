@@ -23,6 +23,11 @@ export const channelMediaFailureReasons = [
   'speech_setup_required',
   'local_speech_setup_required',
   'local_media_decoder_missing',
+  'local_media_decode_failed',
+  'local_media_format_unsupported',
+  'local_media_too_long',
+  'local_media_no_speech',
+  'local_speech_engine_failed',
 ] as const;
 
 export class ChannelMediaFailure extends Error {

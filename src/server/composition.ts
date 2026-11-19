@@ -59,8 +59,12 @@ import type { MemoryCurator } from '../ports/memory-curator.ts';
 import type { DecisionModel, ModelReview } from '../ports/decisions.ts';
 import { createDecisionModel, createOpenRouterDecisionCatalog } from '../providers/decisions.ts';
 import type { SpeechProvider, LocalSpeechControls } from '../ports/speech.ts';
-import { createLocalSpeechProvider } from '../providers/local-speech/index.ts';
 import {
+  createLocalSpeechProvider,
+  LocalSpeechInputError,
+} from '../providers/local-speech/index.ts';
+import {
+  LocalMediaDecodeError,
   LocalMediaDecoderMissing,
   prepareSlackSpeech,
 } from '../providers/local-speech/slack-media.ts';
@@ -187,7 +191,12 @@ import { createMemoryLearning, initializeMemoryLearning } from './memory-learnin
 import { createMemoryService, importMemoryFile } from './memory.ts';
 import { createMemoryRecall } from './memory-recall.ts';
 import { createLearnedSkills } from './learned-skills.ts';
-import { automaticSpeechVoice, createSpeech } from './speech.ts';
+import {
+  automaticSpeechVoice,
+  createSpeech,
+  SpeechSetupError,
+  TranscriptionLengthError,
+} from './speech.ts';
 import {
   activeThread,
   boss,
@@ -3043,11 +3052,34 @@ async function initializeApplication(
           localSpeech &&
           (async (input, signal, report) => {
             const audio = await prepareSlackSpeech(input, signal).catch((error) => {
+              signal.throwIfAborted();
               if (error instanceof LocalMediaDecoderMissing)
                 throw new ChannelMediaFailure('local_media_decoder_missing');
+              if (error instanceof LocalMediaDecodeError)
+                throw new ChannelMediaFailure(
+                  error.reason === 'length'
+                    ? 'local_media_too_long'
+                    : error.reason === 'format'
+                      ? 'local_media_format_unsupported'
+                      : 'local_media_decode_failed',
+                );
               throw error;
             });
-            return audio ? localSpeech.transcribe(audio, signal, report) : null;
+            if (!audio) return null;
+            return localSpeech.transcribe(audio, signal, report).catch((error) => {
+              signal.throwIfAborted();
+              if (error instanceof SpeechSetupError || error instanceof TranscriptionLengthError)
+                throw error;
+              if (error instanceof LocalSpeechInputError)
+                throw new ChannelMediaFailure(
+                  error.reason === 'silence'
+                    ? 'local_media_no_speech'
+                    : error.reason === 'length'
+                      ? 'local_media_too_long'
+                      : 'local_media_decode_failed',
+                );
+              throw new ChannelMediaFailure('local_speech_engine_failed');
+            });
           }),
       }),
       modelConfigured: () => adapters.model.configured,

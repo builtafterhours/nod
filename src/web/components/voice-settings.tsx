@@ -7,6 +7,7 @@ import { useVoiceRecorder } from '../hooks/use-voice-recorder';
 import { api, apiResponse, errorMessage } from '../lib/api';
 import { desktopSettingsAvailable } from '../lib/desktop';
 import { savePreferences } from '../lib/preferences';
+import { CircleCheck } from './icons';
 import { SearchPicker } from './search-picker';
 import { useSettingsDraft } from './settings-drafts';
 import { VoiceConnections } from './voice-connections';
@@ -441,9 +442,11 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
           {data.localInput && (
             <div className="account-preference-row">
               <span>On-device transcription</span>
-              <div className="voice-settings-choice">
+              <div className="voice-settings-choice voice-local-input">
                 {data.localInput.state === 'ready' ? (
-                  <span role="status">Ready</span>
+                  <span className="voice-local-input-status" role="status">
+                    <CircleCheck size={14} aria-hidden="true" /> Ready
+                  </span>
                 ) : preparing === 'input' || data.localInput.state === 'downloading' ? (
                   <>
                     <span role="status">
