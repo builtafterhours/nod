@@ -56,7 +56,7 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
   const [discardConnection, setDiscardConnection] = useState(false);
   const [error, setError] = useState('');
   const [preparationError, setPreparationError] = useState('');
-  const [preparing, setPreparing] = useState(false);
+  const [preparing, setPreparing] = useState<'voice' | 'input' | null>(null);
   const [catalogRefreshing, setCatalogRefreshing] = useState(false);
   const [catalogError, setCatalogError] = useState('');
   const catalogRequest = useRef<AbortController | null>(null);
@@ -85,7 +85,8 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
     setPlaying(null);
     setPreviewing(null);
   }
-  const busy = saving || preparing || connectionBusy || catalogRefreshing || recorder.discovering;
+  const busy =
+    saving || preparing !== null || connectionBusy || catalogRefreshing || recorder.discovering;
   useLayoutEffect(() => {
     onBusyChange(busy);
     return () => onBusyChange(false);
@@ -139,16 +140,18 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
     const timer = window.setTimeout(() => void refresh(), 1000);
     return () => window.clearTimeout(timer);
   }, [preparing, data?.local?.state, data?.localInput?.state, refresh, refreshing]);
-  async function prepare() {
+  async function prepare(target: 'voice' | 'input') {
     if (prepareRequest.current) return;
     const controller = new AbortController();
     prepareRequest.current = controller;
-    setPreparing(true);
+    setPreparing(target);
     setPreparationError('');
     try {
       await api('/api/speech/prepare', {
         method: 'POST',
-        body: JSON.stringify({ locale: navigator.language }),
+        body: JSON.stringify(
+          target === 'input' ? { localInput: true } : { locale: navigator.language },
+        ),
         signal: controller.signal,
       });
       const next = await api<SpeechSettings>('/api/speech', { signal: controller.signal });
@@ -160,7 +163,7 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
       if (prepareRequest.current === controller) {
         prepareRequest.current = null;
         if (mounted.current) {
-          setPreparing(false);
+          setPreparing(null);
           void refresh();
         }
       }
@@ -378,7 +381,7 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
                 playing={playing}
                 error={error || catalogError || data.voicesError || ''}
                 local={data.local}
-                preparing={preparing}
+                preparing={preparing === 'voice'}
                 preparationError={preparationError}
                 refreshing={catalogRefreshing}
                 providers={providerOptions}
@@ -394,7 +397,7 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
                 }}
                 onPreview={(voice) => void preview(voice)}
                 onStop={stop}
-                onPrepare={() => void prepare()}
+                onPrepare={() => void prepare('voice')}
                 onCancelPreparation={() => prepareRequest.current?.abort()}
                 onConnect={(provider) => {
                   stop();
@@ -418,12 +421,12 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
               Your saved voice is unavailable. Check its connection or choose another voice.
             </p>
           )}
-          {!pickerOpen && (preparing || data.local?.state === 'downloading') && (
+          {!pickerOpen && (preparing === 'voice' || data.local?.state === 'downloading') && (
             <p className="field-hint" role="status">
               {(data.local?.progress ?? 0) >= 100
                 ? 'Preparing free voices…'
                 : `Downloading free voices · ${Math.round(data.local?.progress ?? 0)}%`}
-              {preparing && (
+              {preparing === 'voice' && (
                 <Button
                   type="button"
                   variant="ghost"
@@ -433,6 +436,49 @@ export function VoiceSettings({ onBusyChange }: { onBusyChange(busy: boolean): v
                   Cancel
                 </Button>
               )}
+            </p>
+          )}
+          {data.localInput && (
+            <div className="account-preference-row">
+              <span>On-device transcription</span>
+              <div className="voice-settings-choice">
+                {data.localInput.state === 'ready' ? (
+                  <span role="status">Ready</span>
+                ) : preparing === 'input' || data.localInput.state === 'downloading' ? (
+                  <>
+                    <span role="status">
+                      {(data.localInput.progress ?? 0) >= 100
+                        ? 'Preparing…'
+                        : `Downloading · ${Math.round(data.localInput.progress ?? 0)}%`}
+                    </span>
+                    {preparing === 'input' && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => prepareRequest.current?.abort()}
+                      >
+                        Cancel
+                      </Button>
+                    )}
+                  </>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={preparing !== null}
+                    onClick={() => void prepare('input')}
+                  >
+                    Download
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+          {!pickerOpen && preparationError && (
+            <p className="field-hint" role="alert">
+              {preparationError}
             </p>
           )}
           <div className="account-preference-row voice-spoken-row">

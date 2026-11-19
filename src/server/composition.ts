@@ -60,6 +60,10 @@ import type { DecisionModel, ModelReview } from '../ports/decisions.ts';
 import { createDecisionModel, createOpenRouterDecisionCatalog } from '../providers/decisions.ts';
 import type { SpeechProvider, LocalSpeechControls } from '../ports/speech.ts';
 import { createLocalSpeechProvider } from '../providers/local-speech/index.ts';
+import {
+  LocalMediaDecoderMissing,
+  prepareSlackSpeech,
+} from '../providers/local-speech/slack-media.ts';
 import type { MessagingTransport } from '../ports/messaging.ts';
 import type { ChannelSetupVerifier } from '../ports/channel-settings.ts';
 import type { LinkPreviewProvider } from '../ports/link-preview.ts';
@@ -147,7 +151,7 @@ import { localArtifacts } from './artifacts.ts';
 import { memoryFileName, memoryMarkdown } from '../shared/memory-export.ts';
 import { createChannels } from './channels.ts';
 import { createChannelSettings, managedChannelEnvironment } from './channel-settings.ts';
-import { createChannelMedia } from './channel-media.ts';
+import { ChannelMediaFailure, createChannelMedia } from './channel-media.ts';
 import { createChannelSessionStore } from './channel-session.ts';
 import { configuration, dataRoot, desktopMode, ownerId, publicOrigin } from './config.ts';
 import { createAccountStore } from './account-store.ts';
@@ -225,7 +229,7 @@ export interface ApplicationAdapters {
   computer: Computer;
   workspace: Workspace;
   speech: SpeechProvider;
-  localSpeech?: LocalSpeechControls;
+  localSpeech?: LocalSpeechControls & SpeechProvider;
   speechInputFormat?: (voice: string | null) => 'wav' | undefined;
   integrations: IntegrationProvider;
   observations?: ObservationProvider[];
@@ -955,6 +959,9 @@ async function initializeApplication(
   });
   const speechPreferences = createPreferencesStore(pool, ownerId);
   const speechProvider = ledger.speech(adapters.speech);
+  const localSpeech = adapters.localSpeech
+    ? createSpeech(ledger.speech(adapters.localSpeech))
+    : undefined;
   const speech = createSpeech({
     ...speechProvider,
     get configured() {
@@ -3029,7 +3036,20 @@ async function initializeApplication(
       ownerId,
       present: communication.present,
       resolveAttachments: artifacts.readThreadArtifacts,
-      media: createChannelMedia({ artifacts, speech }),
+      media: createChannelMedia({
+        artifacts,
+        speech,
+        slackTranscribe:
+          localSpeech &&
+          (async (input, signal, report) => {
+            const audio = await prepareSlackSpeech(input, signal).catch((error) => {
+              if (error instanceof LocalMediaDecoderMissing)
+                throw new ChannelMediaFailure('local_media_decoder_missing');
+              throw error;
+            });
+            return audio ? localSpeech.transcribe(audio, signal, report) : null;
+          }),
+      }),
       modelConfigured: () => adapters.model.configured,
       verificationPending: async (channel) => (await chatVerification.pending(channel)).length > 0,
       attributeMediaUsage: ledger.attributeMediaUsage,

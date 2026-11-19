@@ -842,6 +842,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               if (!(await transaction(currentConversation, pool)))
                 throw new ChannelMediaFailure('unavailable');
             },
+            identity.provider === 'slack',
           );
           text = [text, media.text].filter(Boolean).join('\n\n');
           if (text.length > 100_000) throw new ChannelMediaFailure('text_too_long');

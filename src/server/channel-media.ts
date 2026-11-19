@@ -21,6 +21,8 @@ export const channelMediaFailureReasons = [
   'voice_mime_invalid',
   'transcription_unavailable',
   'speech_setup_required',
+  'local_speech_setup_required',
+  'local_media_decoder_missing',
 ] as const;
 
 export class ChannelMediaFailure extends Error {
@@ -37,12 +39,18 @@ export class ChannelMediaFailure extends Error {
 export function createChannelMedia(options: {
   artifacts: Pick<ArtifactService, 'storeArtifact'>;
   speech: Pick<SpeechService, 'transcribe'>;
+  slackTranscribe?: (
+    input: { bytes: Buffer; mimeType: string; name: string },
+    signal: AbortSignal,
+    report: NonNullable<Parameters<SpeechService['transcribe']>[2]>,
+  ) => Promise<string | null>;
 }) {
   return {
     async prepare(
       attachments: MessagingAttachment[],
       signal: AbortSignal,
       beforeTranscribe?: () => Promise<void>,
+      slack = false,
     ) {
       if (!attachments.length) throw new ChannelMediaFailure('unavailable');
       if (attachments.length > 10) throw new ChannelMediaFailure('too_large');
@@ -81,21 +89,28 @@ export function createChannelMedia(options: {
         if (attachment.size && bytes.length !== attachment.size)
           throw new ChannelMediaFailure('attachment_size_mismatch');
         if (total > 50 * 1024 * 1024) throw new ChannelMediaFailure('too_large');
-        if (attachment.voice) {
-          if (!attachment.mimeType.startsWith('audio/'))
+        const video = slack && attachment.mimeType.toLowerCase().startsWith('video/');
+        if (attachment.voice || video) {
+          if (!video && !attachment.mimeType.startsWith('audio/'))
             throw new ChannelMediaFailure('voice_mime_invalid');
           if (bytes.length > 25 * 1024 * 1024) throw new ChannelMediaFailure('too_large');
           try {
             await beforeTranscribe?.();
-            transcripts.push(
-              await options.speech.transcribe({ ...attachment, bytes }, signal, (usage) => {
-                usageIds.add(usage.id);
-              }),
-            );
+            const report = (usage: { id: string }) => {
+              usageIds.add(usage.id);
+            };
+            const input = { bytes, mimeType: attachment.mimeType, name: attachment.name };
+            const transcribe = slack ? options.slackTranscribe : options.speech.transcribe;
+            if (!transcribe) throw new SpeechSetupError();
+            const transcript = await transcribe(input, signal, report);
+            if (transcript) transcripts.push(transcript);
           } catch (error) {
             signal.throwIfAborted();
+            if (error instanceof ChannelMediaFailure) throw error;
             if (error instanceof SpeechSetupError)
-              throw new ChannelMediaFailure('speech_setup_required');
+              throw new ChannelMediaFailure(
+                slack ? 'local_speech_setup_required' : 'speech_setup_required',
+              );
             if (error instanceof TranscriptionLengthError)
               throw new ChannelMediaFailure('text_too_long');
             throw new ChannelMediaFailure('transcription_unavailable');
