@@ -17,6 +17,25 @@ export class MessagingAttachmentError extends Error {
   }
 }
 
+export class MessagingAttachmentReadError extends Error {
+  readonly httpStatus?: number;
+
+  constructor(
+    readonly reason:
+      'metadata_unavailable' | 'download_url_rejected' | 'download_failed' | 'download_http_error',
+    httpStatus?: number,
+  ) {
+    super(reason);
+    if (
+      typeof httpStatus === 'number' &&
+      Number.isInteger(httpStatus) &&
+      httpStatus >= 100 &&
+      httpStatus <= 599
+    )
+      this.httpStatus = httpStatus;
+  }
+}
+
 export interface MessagingChannel {
   id: string;
   status: 'disabled' | 'setup_required' | 'configured';

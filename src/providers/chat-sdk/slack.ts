@@ -22,6 +22,7 @@ import type {
 } from '../../ports/messaging.ts';
 import {
   MessagingAttachmentError,
+  MessagingAttachmentReadError,
   MessagingConnectionError,
   MessagingDeliveryError,
 } from '../../ports/messaging.ts';
@@ -607,36 +608,50 @@ export function createSlackTransport(
           AbortSignal.timeout(60_000),
           ...(signal ? [signal] : []),
         ]);
-        const response = await fetch(fileUrl(file.url_private_download ?? file.url_private), {
-          headers: { Authorization: `Bearer ${parsed.success ? parsed.data.botToken : ''}` },
-          redirect: 'error',
-          signal: operation,
-        });
-        if (!response.ok || !response.body)
-          throw new MessagingConnectionError(
-            `Slack file download failed: HTTP ${response.status}.`,
-          );
-        if (Number(response.headers.get('content-length') ?? 0) > fileLimit) {
-          await response.body.cancel();
-          throw new MessagingAttachmentError(fileLimit);
-        }
-        const reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let size = 0;
+        let address: string;
         try {
-          for (;;) {
-            operation.throwIfAborted();
-            const next = await reader.read();
-            if (next.done) break;
-            size += next.value.length;
-            if (size > fileLimit) throw new MessagingAttachmentError(fileLimit);
-            chunks.push(next.value);
-          }
-        } finally {
-          await reader.cancel().catch(() => {});
-          reader.releaseLock();
+          address = fileUrl(file.url_private_download ?? file.url_private);
+        } catch {
+          throw new MessagingAttachmentReadError('download_url_rejected');
         }
-        return Buffer.concat(chunks);
+        try {
+          const response = await fetch(address, {
+            headers: { Authorization: `Bearer ${parsed.success ? parsed.data.botToken : ''}` },
+            redirect: 'error',
+            signal: operation,
+          });
+          if (!response.ok || !response.body)
+            throw new MessagingAttachmentReadError('download_http_error', response.status);
+          if (Number(response.headers.get('content-length') ?? 0) > fileLimit) {
+            await response.body.cancel();
+            throw new MessagingAttachmentError(fileLimit);
+          }
+          const reader = response.body.getReader();
+          const chunks: Uint8Array[] = [];
+          let size = 0;
+          try {
+            for (;;) {
+              operation.throwIfAborted();
+              const next = await reader.read();
+              if (next.done) break;
+              size += next.value.length;
+              if (size > fileLimit) throw new MessagingAttachmentError(fileLimit);
+              chunks.push(next.value);
+            }
+          } finally {
+            await reader.cancel().catch(() => {});
+            reader.releaseLock();
+          }
+          return Buffer.concat(chunks);
+        } catch (error) {
+          operation.throwIfAborted();
+          if (
+            error instanceof MessagingAttachmentError ||
+            error instanceof MessagingAttachmentReadError
+          )
+            throw error;
+          throw new MessagingAttachmentReadError('download_failed');
+        }
       },
     };
   }
@@ -650,7 +665,7 @@ export function createSlackTransport(
     )
       return attachment(file.data);
     const reference = fileSchema.pick({ id: true }).safeParse(value);
-    let error = new MessagingConnectionError('Slack failed: file_metadata_unavailable.');
+    let error = new MessagingAttachmentReadError('metadata_unavailable');
     if (reference.success) {
       try {
         const result = await web!.files.info({ file: reference.data.id });
@@ -662,7 +677,10 @@ export function createSlackTransport(
         )
           return attachment(resolved.data);
       } catch (cause) {
-        error = failure(cause);
+        error = new MessagingAttachmentReadError(
+          'metadata_unavailable',
+          cause instanceof WebAPIHTTPError ? cause.statusCode : undefined,
+        );
       }
     }
     return {

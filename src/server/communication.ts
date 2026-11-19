@@ -30,10 +30,22 @@ For interrupted, state that the task was interrupted and any outside outcome may
 For failed, the work stopped on error, the reason as Nod's system reported it. Say what failed in plain words and keep every detail of error that tells the owner what to fix, such as credits, a key, a rate limit, a model or an amount, then the next step it points to, such as fixing that and asking again. Do not claim anything about outside actions beyond what error says.
 For interrupted or failed, work, when supplied, names the schedule or task that stopped while the owner may not be looking at it; name it so they know which work this is about.
 For verification_failure, the result of private entry is unconfirmed. Tell the owner to check the current sign-in or payment state before any fresh attempt. Never claim the code was not applied or the payment failed, and never imply an automatic retry or replay.
-For media_failure, the attachment was not submitted to a task. For too_large, explain the applicable limits: up to 10 files with a combined size of 50 MB and voice transcription up to 25 MB. When fileLimitMb is supplied, give that per-file channel limit too. For text_too_long, explain that the caption and transcript together exceed 100,000 characters; ask for a shorter message. For speech_setup_required, explain that voice messages need audio set up in ${appPages['/settings/voice']}, where the owner can use a connected voice service or download free voices. A ChatGPT or Claude subscription alone does not include cloud speech. The owner can type the message instead. For transcription_unavailable, explain that voice transcription is unavailable and the owner can type the message or check the speech setup. For unavailable, explain that Nod could not read the attachment and the owner can attach it in Nod. Do not claim an automatic retry.
+For media_failure, the attachment was not submitted to a task. For too_large, explain the applicable limits: up to 10 files with a combined size of 50 MB and voice transcription up to 25 MB. When fileLimitMb is supplied, give that per-file channel limit too. For text_too_long, explain that the caption and transcript together exceed 100,000 characters; ask for a shorter message. For speech_setup_required, explain that voice messages need audio set up in ${appPages['/settings/voice']}, where the owner can use a connected voice service or download free voices. A ChatGPT or Claude subscription alone does not include cloud speech. The owner can type the message instead. For transcription_unavailable, explain that voice transcription is unavailable and the owner can type the message or check the speech setup. Do not claim an automatic retry.
 For other purposes, explain the supplied state and the available next step without inventing success, authorization or a retry. Outside the explicitly supplied payment security_code step, refer the user to Nod's private form for required secret entry. Never ask for a password, card number or API key in chat. Your message cannot change the action or the server's requirements.`;
 
 const response = z.object({ text: z.string().trim().min(1) }).strict();
+const attachmentFailures = {
+  unavailable: 'Attachment preparation is unavailable.',
+  metadata_unavailable: 'The attachment metadata could not be resolved.',
+  download_url_rejected:
+    'The attachment download address was missing or refused by the safety checks.',
+  download_failed: 'The attachment download did not complete.',
+  download_http_error: 'The attachment download returned an unsuccessful HTTP response or no body.',
+  attachment_read_failed: 'The attachment could not be read.',
+  attachment_empty: 'The attachment download contained no bytes.',
+  attachment_size_mismatch: 'The downloaded attachment size did not match its declared size.',
+  voice_mime_invalid: 'The voice attachment did not declare an audio media type.',
+};
 const actionResponse = z
   .object({
     text: z.string().trim().min(1).max(12_000),
@@ -333,6 +345,17 @@ export function createCommunication(options: {
   ) {
     if (input.kind === 'confirmation')
       throw new Error('Confirmations require a saved action description.');
+    if (
+      input.kind === 'media_failure' &&
+      typeof input.reason === 'string' &&
+      Object.hasOwn(attachmentFailures, input.reason)
+    ) {
+      const reason = input.reason as keyof typeof attachmentFailures;
+      const status = z.number().int().min(100).max(599).safeParse(input.httpStatus);
+      return Promise.resolve(
+        `${attachmentFailures[reason]} It was not submitted to a task. You can type the message instead. If you report this failure, include this diagnostic: ${reason}${status.success ? ` (HTTP ${status.data})` : ''}.`,
+      );
+    }
     if (input.kind === 'media_failure' && 'languageMessage' in input) {
       const { languageMessage, ...data } = input;
       const supplied = z

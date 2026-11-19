@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg';
 import type { MessagingAttachment } from '../ports/messaging.ts';
-import { MessagingAttachmentError } from '../ports/messaging.ts';
+import { MessagingAttachmentError, MessagingAttachmentReadError } from '../ports/messaging.ts';
 import type { ArtifactService } from './artifacts.ts';
 import type { SpeechService } from './speech.ts';
 import { SpeechSetupError, TranscriptionLengthError } from './speech.ts';
@@ -11,9 +11,15 @@ export class ChannelMediaFailure extends Error {
       | 'too_large'
       | 'text_too_long'
       | 'unavailable'
+      | MessagingAttachmentReadError['reason']
+      | 'attachment_read_failed'
+      | 'attachment_empty'
+      | 'attachment_size_mismatch'
+      | 'voice_mime_invalid'
       | 'transcription_unavailable'
       | 'speech_setup_required',
     readonly fileLimitMb?: number,
+    readonly httpStatus?: number,
   ) {
     super(reason);
   }
@@ -51,17 +57,19 @@ export function createChannelMedia(options: {
           signal.throwIfAborted();
           if (error instanceof MessagingAttachmentError)
             throw new ChannelMediaFailure('too_large', error.maxBytes / 1024 / 1024);
-          throw new ChannelMediaFailure('unavailable');
+          if (error instanceof MessagingAttachmentReadError)
+            throw new ChannelMediaFailure(error.reason, undefined, error.httpStatus);
+          throw new ChannelMediaFailure('attachment_read_failed');
         }
         signal.throwIfAborted();
         total += bytes.length;
-        if (!bytes.length) throw new ChannelMediaFailure('unavailable');
+        if (!bytes.length) throw new ChannelMediaFailure('attachment_empty');
         if (attachment.size && bytes.length !== attachment.size)
-          throw new ChannelMediaFailure('unavailable');
+          throw new ChannelMediaFailure('attachment_size_mismatch');
         if (total > 50 * 1024 * 1024) throw new ChannelMediaFailure('too_large');
         if (attachment.voice) {
           if (!attachment.mimeType.startsWith('audio/'))
-            throw new ChannelMediaFailure('unavailable');
+            throw new ChannelMediaFailure('voice_mime_invalid');
           if (bytes.length > 25 * 1024 * 1024) throw new ChannelMediaFailure('too_large');
           try {
             await beforeTranscribe?.();

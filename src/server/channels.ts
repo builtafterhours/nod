@@ -47,6 +47,7 @@ export type ChannelPresentation =
       kind: 'media_failure';
       reason: ChannelMediaFailure['reason'];
       fileLimitMb?: number;
+      httpStatus?: number;
       languageMessage?: { at: string; text: string };
     }
   | { kind: 'verification_failure'; verification: 'otp' }
@@ -868,6 +869,9 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                   reason: error instanceof ChannelMediaFailure ? error.reason : 'unavailable',
                   ...(error instanceof ChannelMediaFailure && error.fileLimitMb
                     ? { fileLimitMb: error.fileLimitMb }
+                    : {}),
+                  ...(error instanceof ChannelMediaFailure && error.httpStatus
+                    ? { httpStatus: error.httpStatus }
                     : {}),
                 },
               }),
