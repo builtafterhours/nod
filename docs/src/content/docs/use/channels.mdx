@@ -216,7 +216,7 @@ Nod saves each **Stop** or **Status** press, or native Stop, before it acknowled
 
 Controls expire after 15 minutes and renew while the same work is running. Disconnect invalidates them without cancelling work in other channels. A processing indicator can remain in Slack until Slack's timeout or a verified refresh clears it. Nod doesn't use removed credentials to update it.
 
-For longer work, the same in-thread control message shows Nod's brief activity line when one is available. It updates in place and clears when work ends or waits for you. Quick replies do not get an activity line. These lines describe current work, not reasoning, tool arguments or verified results. Slack's native processing indicator remains separate.
+While a main-chat turn is working, the in-thread controls do not repeat Slack's native working label. For longer work, the same message shows Nod's brief activity line when one is available. It updates in place and clears when work ends or waits for you. Quick replies do not get an activity line. These lines describe current work, not reasoning, tool arguments or verified results.
 
 After an ordinary main-chat reply succeeds, Nod removes its temporary control message rather than adding a **Ready** card. Native session status still changes. Needs-you, failure and stop notices remain, as do saved task cards.
 

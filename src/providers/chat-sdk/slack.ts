@@ -1143,20 +1143,24 @@ export function createSlackTransport(
             updateRichError();
             return {};
           }
+          const workingChatControls =
+            !input.task && !input.outcome && input.status === 'processing' && input.control;
+          const state =
+            input.outcome === 'failed'
+              ? 'Failed'
+              : input.outcome === 'cancelled'
+                ? 'Stopped'
+                : input.status === 'processing'
+                  ? 'Working'
+                  : input.status === 'suspended'
+                    ? 'Needs you'
+                    : input.status === 'closed'
+                      ? 'Closed'
+                      : 'Ready';
           const header = [
-            input.title,
-            (input.task ? 'Overall task: ' : '') +
-              (input.outcome === 'failed'
-                ? 'Failed'
-                : input.outcome === 'cancelled'
-                  ? 'Stopped'
-                  : input.status === 'processing'
-                    ? 'Working'
-                    : input.status === 'suspended'
-                      ? 'Needs you'
-                      : input.status === 'closed'
-                        ? 'Closed'
-                        : 'Ready'),
+            ...(workingChatControls
+              ? []
+              : [input.title, (input.task ? 'Overall task: ' : '') + state]),
             input.text,
             input.status === 'processing' ? input.activity : '',
           ]
@@ -1205,7 +1209,7 @@ export function createSlackTransport(
           if (!bounded)
             planText =
               'Plan states unknown; reported intent unavailable. Step outcomes are unverified.';
-          const literalHeader = header
+          const literalHeader = (header || 'Nod controls: Stop or Status.')
             .replaceAll('&', '&amp;')
             .replaceAll('<', '&lt;')
             .replaceAll('>', '&gt;');
@@ -1221,9 +1225,12 @@ export function createSlackTransport(
           ]
             .filter(Boolean)
             .join('\n');
-          let blocks: NonNullable<ChatStopStreamArguments['blocks']> = [
-            { type: 'section', text: { type: 'plain_text', text: header.slice(0, 2900) } },
-          ];
+          let blocks: NonNullable<ChatStopStreamArguments['blocks']> = [];
+          if (header)
+            blocks.push({
+              type: 'section',
+              text: { type: 'plain_text', text: header.slice(0, 2900) },
+            });
           if (planText)
             blocks.push({ type: 'section', text: { type: 'plain_text', text: planText } });
           if (nativePlan && bounded) blocks.push(nativePlan);
