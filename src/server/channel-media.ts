@@ -5,21 +5,30 @@ import type { ArtifactService } from './artifacts.ts';
 import type { SpeechService } from './speech.ts';
 import { SpeechSetupError, TranscriptionLengthError } from './speech.ts';
 
+export const channelMediaFailureReasons = [
+  'too_large',
+  'text_too_long',
+  'unavailable',
+  'metadata_unavailable',
+  'download_url_rejected',
+  'download_failed',
+  'download_http_error',
+  'download_timeout',
+  'preparation_timeout',
+  'attachment_read_failed',
+  'attachment_empty',
+  'attachment_size_mismatch',
+  'voice_mime_invalid',
+  'transcription_unavailable',
+  'speech_setup_required',
+] as const;
+
 export class ChannelMediaFailure extends Error {
   constructor(
-    readonly reason:
-      | 'too_large'
-      | 'text_too_long'
-      | 'unavailable'
-      | MessagingAttachmentReadError['reason']
-      | 'attachment_read_failed'
-      | 'attachment_empty'
-      | 'attachment_size_mismatch'
-      | 'voice_mime_invalid'
-      | 'transcription_unavailable'
-      | 'speech_setup_required',
+    readonly reason: (typeof channelMediaFailureReasons)[number],
     readonly fileLimitMb?: number,
     readonly httpStatus?: number,
+    readonly serviceCode?: MessagingAttachmentReadError['serviceCode'],
   ) {
     super(reason);
   }
@@ -58,7 +67,12 @@ export function createChannelMedia(options: {
           if (error instanceof MessagingAttachmentError)
             throw new ChannelMediaFailure('too_large', error.maxBytes / 1024 / 1024);
           if (error instanceof MessagingAttachmentReadError)
-            throw new ChannelMediaFailure(error.reason, undefined, error.httpStatus);
+            throw new ChannelMediaFailure(
+              error.reason,
+              undefined,
+              error.httpStatus,
+              error.serviceCode,
+            );
           throw new ChannelMediaFailure('attachment_read_failed');
         }
         signal.throwIfAborted();

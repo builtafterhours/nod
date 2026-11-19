@@ -602,12 +602,11 @@ export function createSlackTransport(
       size: file.size,
       ...(file.mimetype.startsWith('audio/') ? { voice: true } : {}),
       async read(signal) {
+        signal?.throwIfAborted();
+        lifetime.signal.throwIfAborted();
         if (file.size > fileLimit) throw new MessagingAttachmentError(fileLimit);
-        const operation = AbortSignal.any([
-          lifetime.signal,
-          AbortSignal.timeout(60_000),
-          ...(signal ? [signal] : []),
-        ]);
+        const timeout = AbortSignal.timeout(60_000);
+        const operation = AbortSignal.any([lifetime.signal, timeout, ...(signal ? [signal] : [])]);
         let address: string;
         try {
           address = fileUrl(file.url_private_download ?? file.url_private);
@@ -644,6 +643,9 @@ export function createSlackTransport(
           }
           return Buffer.concat(chunks);
         } catch (error) {
+          signal?.throwIfAborted();
+          lifetime.signal.throwIfAborted();
+          if (timeout.aborted) throw new MessagingAttachmentReadError('download_timeout');
           operation.throwIfAborted();
           if (
             error instanceof MessagingAttachmentError ||
@@ -679,7 +681,16 @@ export function createSlackTransport(
       } catch (cause) {
         error = new MessagingAttachmentReadError(
           'metadata_unavailable',
-          cause instanceof WebAPIHTTPError ? cause.statusCode : undefined,
+          cause instanceof WebAPIHTTPError
+            ? cause.statusCode
+            : cause instanceof WebAPIRateLimitedError
+              ? 429
+              : undefined,
+          cause instanceof WebAPIPlatformError
+            ? cause.data.error
+            : cause instanceof WebAPIRateLimitedError
+              ? 'rate_limited'
+              : undefined,
         );
       }
     }

@@ -17,7 +17,7 @@ If the desktop app runs Nod, quitting it stops channel replies. The computer mus
 
 Nod replies in the app you wrote from. A message from Telegram gets its answer on Telegram, and a schedule you set up there sends its results there too. Everything also shows in the chat in the Nod app.
 
-Nod uses your conversation language for pairing notices and private-step guidance. Its model writes the message; the server adds permitted file links and keeps private sign-in and payment links out of chat apps. Attachment read failures use a fixed English diagnostic without a model call, file details or links. A failed attachment does not start a task.
+Nod uses your conversation language for pairing notices, private-step guidance and attachment recovery. Its model writes the message; an attachment's caption can help set the recovery language, but an unread attachment does not start a task. The server adds a bounded diagnostic to attachment-failure notices and removes links from them. Private sign-in and payment links stay out of chat apps.
 
 ## Before you start
 
@@ -148,7 +148,7 @@ Slack lets you leave several reactions on one message. Nod tracks only your late
 
 With rich mode, Nod tracks supported reactions separately. Removing one shows your most recently added remaining reaction. This display change never approves or repeats an action. Custom emoji have no inferred meaning. Reactions missed during an outage are not reconstructed from history.
 
-Nod resolves incomplete Slack file metadata before reading the exact file. If this fails, or the download cannot be read, Nod reports a bounded diagnostic instead of silently ignoring your message. The diagnostic distinguishes unavailable metadata, a refused download address, download failure, an HTTP response, empty bytes, a size mismatch and a voice attachment without an audio media type. It includes an HTTP status when available, never the file's address, name, identifiers or contents. A download failure does not establish a decoding or speech-setup problem.
+Nod resolves incomplete Slack file metadata before reading the exact file. If this fails, or the download cannot be read, Nod reports a bounded diagnostic instead of silently ignoring your message. The diagnostic distinguishes unavailable metadata, a refused download address, download failure or timeout, a preparation timeout, an HTTP response, empty bytes, a size mismatch and a voice attachment without an audio media type. It includes an HTTP status and a recognized Slack service code when available, never the file's address, name, identifiers or contents. Unknown service errors stay generic. A preparation timeout can happen during transcription; it does not identify a particular stage. A download failure does not establish a decoding or speech-setup problem.
 
 Type the message without the file to continue. Include the diagnostic if you report the failure; Nod does not promise that uploading the same file elsewhere will work. Speech setup and transcription failures remain separate notices. Media preparation finishes before Nod acknowledges intake, so Slack can redeliver slow uploads. Saved messages and failed inputs are deduplicated; replay does not submit unread input or repeat its notice.
 

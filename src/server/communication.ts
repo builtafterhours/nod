@@ -1,6 +1,12 @@
 import type { Pool } from 'pg';
 import { z } from 'zod';
+import type { Nodes } from 'mdast';
+import { unified } from 'unified';
+import remarkParse from 'remark-parse';
+import remarkGfm from 'remark-gfm';
 import type { ModelReview } from '../ports/decisions.ts';
+import { messagingAttachmentServiceCodes } from '../ports/messaging.ts';
+import { channelMediaFailureReasons } from './channel-media.ts';
 import type { ApprovalDescription, ApprovalPresentation } from './approvals.ts';
 import type { ChannelPresentation } from './channels.ts';
 import { redactSecretText, withoutSecretKeys } from './redaction.ts';
@@ -30,22 +36,40 @@ For interrupted, state that the task was interrupted and any outside outcome may
 For failed, the work stopped on error, the reason as Nod's system reported it. Say what failed in plain words and keep every detail of error that tells the owner what to fix, such as credits, a key, a rate limit, a model or an amount, then the next step it points to, such as fixing that and asking again. Do not claim anything about outside actions beyond what error says.
 For interrupted or failed, work, when supplied, names the schedule or task that stopped while the owner may not be looking at it; name it so they know which work this is about.
 For verification_failure, the result of private entry is unconfirmed. Tell the owner to check the current sign-in or payment state before any fresh attempt. Never claim the code was not applied or the payment failed, and never imply an automatic retry or replay.
-For media_failure, the attachment was not submitted to a task. For too_large, explain the applicable limits: up to 10 files with a combined size of 50 MB and voice transcription up to 25 MB. When fileLimitMb is supplied, give that per-file channel limit too. For text_too_long, explain that the caption and transcript together exceed 100,000 characters; ask for a shorter message. For speech_setup_required, explain that voice messages need audio set up in ${appPages['/settings/voice']}, where the owner can use a connected voice service or download free voices. A ChatGPT or Claude subscription alone does not include cloud speech. The owner can type the message instead. For transcription_unavailable, explain that voice transcription is unavailable and the owner can type the message or check the speech setup. Do not claim an automatic retry.
+For media_failure, the attachment was not submitted to a task. Write in the owner's conversation language. Do not include links, URLs or routes, even for Nod screens; name the screen instead. Do not write diagnostic tokens; the server appends them. For metadata_unavailable, file metadata could not be resolved; serviceCode, when supplied, is the service's reported reason, not a guessed remedy. For download_url_rejected, the download address was missing or refused by safety checks. For download_failed or attachment_read_failed, downloading or reading did not complete. For download_http_error, the download returned an unsuccessful HTTP response or no body. For download_timeout, the download exceeded its time limit. For preparation_timeout, attachment preparation exceeded its time limit, possibly during transcription; do not claim a specific stage. For attachment_empty, the download contained no bytes. For attachment_size_mismatch, downloaded bytes did not match the declared size. For voice_mime_invalid, a voice attachment did not declare an audio media type; do not infer a container or decoding fault. For unavailable, preparation was unavailable without a more specific cause. For these preparation failures, offer typing the message instead and including the appended diagnostic when reporting the failure; do not suggest attaching the same file in Nod as a cure or infer a speech setup problem. For too_large, explain the applicable limits: up to 10 files with a combined size of 50 MB and voice transcription up to 25 MB. When fileLimitMb is supplied, give that per-file channel limit too. For text_too_long, explain that the caption and transcript together exceed 100,000 characters; ask for a shorter message. For speech_setup_required, explain that voice messages need audio set up in ${appPages['/settings/voice']}, where the owner can use a connected voice service or download free voices. A ChatGPT or Claude subscription alone does not include cloud speech. The owner can type the message instead. For transcription_unavailable, explain that voice transcription is unavailable and the owner can type the message or check the speech setup. Do not claim an automatic retry.
 For other purposes, explain the supplied state and the available next step without inventing success, authorization or a retry. Outside the explicitly supplied payment security_code step, refer the user to Nod's private form for required secret entry. Never ask for a password, card number or API key in chat. Your message cannot change the action or the server's requirements.`;
 
 const response = z.object({ text: z.string().trim().min(1) }).strict();
-const attachmentFailures = {
-  unavailable: 'Attachment preparation is unavailable.',
-  metadata_unavailable: 'The attachment metadata could not be resolved.',
-  download_url_rejected:
-    'The attachment download address was missing or refused by the safety checks.',
-  download_failed: 'The attachment download did not complete.',
-  download_http_error: 'The attachment download returned an unsuccessful HTTP response or no body.',
-  attachment_read_failed: 'The attachment could not be read.',
-  attachment_empty: 'The attachment download contained no bytes.',
-  attachment_size_mismatch: 'The downloaded attachment size did not match its declared size.',
-  voice_mime_invalid: 'The voice attachment did not declare an audio media type.',
-};
+const mediaFailure = z.object({
+  kind: z.literal('media_failure'),
+  reason: z.enum(channelMediaFailureReasons),
+  fileLimitMb: z.number().positive().max(50).optional().catch(undefined),
+  httpStatus: z.number().int().min(100).max(599).optional().catch(undefined),
+  serviceCode: z.enum(messagingAttachmentServiceCodes).optional().catch(undefined),
+});
+const mediaMarkdown = unified().use(remarkParse).use(remarkGfm);
+
+function mediaFailureText(text: string) {
+  function plain(node: Nodes): string {
+    if ('children' in node)
+      return node.children
+        .map(plain)
+        .join(['root', 'list', 'blockquote'].includes(node.type) ? '\n' : '');
+    if (node.type === 'text') return node.value;
+    if (node.type === 'break') return '\n';
+    return '';
+  }
+  return z
+    .string()
+    .trim()
+    .min(1)
+    .parse(
+      plain(mediaMarkdown.parse(text)).replace(
+        /(?:[a-z][a-z0-9+.-]*:(?=\S)|www\.|(?<!\w)\/)[^\s<>]*|[\w.+-]+@[\w.-]+\.[a-z]{2,}|\b[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:[^\s<>]*)/gi,
+        '',
+      ),
+    );
+}
 const actionResponse = z
   .object({
     text: z.string().trim().min(1).max(12_000),
@@ -345,29 +369,21 @@ export function createCommunication(options: {
   ) {
     if (input.kind === 'confirmation')
       throw new Error('Confirmations require a saved action description.');
-    if (
-      input.kind === 'media_failure' &&
-      typeof input.reason === 'string' &&
-      Object.hasOwn(attachmentFailures, input.reason)
-    ) {
-      const reason = input.reason as keyof typeof attachmentFailures;
-      const status = z.number().int().min(100).max(599).safeParse(input.httpStatus);
-      return Promise.resolve(
-        `${attachmentFailures[reason]} It was not submitted to a task. You can type the message instead. If you report this failure, include this diagnostic: ${reason}${status.success ? ` (HTTP ${status.data})` : ''}.`,
-      );
-    }
-    if (input.kind === 'media_failure' && 'languageMessage' in input) {
-      const { languageMessage, ...data } = input;
+    if (input.kind === 'media_failure') {
+      const data = mediaFailure.parse(input);
       const supplied = z
         .object({ at: z.iso.datetime(), text: z.string() })
-        .safeParse(languageMessage);
+        .safeParse(input.languageMessage);
       return generate(
         threadId,
         input.kind,
         data,
         signal,
         supplied.success ? supplied.data : undefined,
-      ).then(({ text }) => text);
+      ).then(
+        ({ text }) =>
+          `${mediaFailureText(text)}\n\nDiagnostic: ${data.reason}${data.httpStatus ? ` (HTTP ${data.httpStatus})` : ''}${data.serviceCode ? ` (${data.serviceCode})` : ''}.`,
+      );
     }
     return generate(threadId, input.kind, input, signal).then(({ text }) => text);
   }

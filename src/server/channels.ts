@@ -48,6 +48,7 @@ export type ChannelPresentation =
       reason: ChannelMediaFailure['reason'];
       fileLimitMb?: number;
       httpStatus?: number;
+      serviceCode?: ChannelMediaFailure['serviceCode'];
       languageMessage?: { at: string; text: string };
     }
   | { kind: 'verification_failure'; verification: 'otp' }
@@ -831,11 +832,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         return;
       }
       if (hasMedia) {
+        const preparationTimeout = AbortSignal.timeout(120_000);
         try {
           if (!options.media) throw new ChannelMediaFailure('unavailable');
           media = await options.media.prepare(
             parsed.data.attachments!,
-            AbortSignal.any([receiveSignal, AbortSignal.timeout(120_000)]),
+            AbortSignal.any([receiveSignal, preparationTimeout]),
             async () => {
               if (!(await transaction(currentConversation, pool)))
                 throw new ChannelMediaFailure('unavailable');
@@ -845,6 +847,11 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           if (text.length > 100_000) throw new ChannelMediaFailure('text_too_long');
         } catch (error) {
           if (closed || replacing || receiveSignal.aborted || !permitted(identity)) return;
+          const failure = preparationTimeout.aborted
+            ? new ChannelMediaFailure('preparation_timeout')
+            : error instanceof ChannelMediaFailure
+              ? error
+              : new ChannelMediaFailure('unavailable');
           if (modelMissingAtIntake || options.modelConfigured?.() === false) {
             await requestModelSetup();
             return;
@@ -866,13 +873,10 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                   ...(caption
                     ? { languageMessage: { at: sentAt.toISOString(), text: caption } }
                     : {}),
-                  reason: error instanceof ChannelMediaFailure ? error.reason : 'unavailable',
-                  ...(error instanceof ChannelMediaFailure && error.fileLimitMb
-                    ? { fileLimitMb: error.fileLimitMb }
-                    : {}),
-                  ...(error instanceof ChannelMediaFailure && error.httpStatus
-                    ? { httpStatus: error.httpStatus }
-                    : {}),
+                  reason: failure.reason,
+                  ...(failure.fileLimitMb ? { fileLimitMb: failure.fileLimitMb } : {}),
+                  ...(failure.httpStatus ? { httpStatus: failure.httpStatus } : {}),
+                  ...(failure.serviceCode ? { serviceCode: failure.serviceCode } : {}),
                 },
               }),
             );

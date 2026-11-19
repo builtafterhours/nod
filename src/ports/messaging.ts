@@ -17,13 +17,26 @@ export class MessagingAttachmentError extends Error {
   }
 }
 
+export const messagingAttachmentServiceCodes = [
+  'rate_limited',
+  'file_not_found',
+  'missing_scope',
+  'file_deleted',
+] as const;
+
 export class MessagingAttachmentReadError extends Error {
   readonly httpStatus?: number;
+  readonly serviceCode?: (typeof messagingAttachmentServiceCodes)[number];
 
   constructor(
     readonly reason:
-      'metadata_unavailable' | 'download_url_rejected' | 'download_failed' | 'download_http_error',
+      | 'metadata_unavailable'
+      | 'download_url_rejected'
+      | 'download_failed'
+      | 'download_http_error'
+      | 'download_timeout',
     httpStatus?: number,
+    serviceCode?: string,
   ) {
     super(reason);
     if (
@@ -33,6 +46,7 @@ export class MessagingAttachmentReadError extends Error {
       httpStatus <= 599
     )
       this.httpStatus = httpStatus;
+    this.serviceCode = messagingAttachmentServiceCodes.find((code) => code === serviceCode);
   }
 }
 
