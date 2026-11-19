@@ -90,6 +90,7 @@ export interface MessagingConversation {
   status: 'processing' | 'active' | 'suspended' | 'closed';
   title: string;
   text: string;
+  activity?: string;
   control?: { stop: string; status: string };
   task?: {
     state: string;

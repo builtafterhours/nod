@@ -210,6 +210,8 @@ Nod saves each **Stop** or **Status** press, or native Stop, before it acknowled
 
 Controls expire after 15 minutes and renew while the same work is running. Disconnect invalidates them without cancelling work in other channels. A processing indicator can remain in Slack until Slack's timeout or a verified refresh clears it. Nod doesn't use removed credentials to update it.
 
+For longer work, the same in-thread control message shows Nod's brief activity line when one is available. It updates in place and clears when work ends or waits for you. Quick replies do not get an activity line. These lines describe current work, not reasoning, tool arguments or verified results. Slack's native processing indicator remains separate.
+
 If a restart leaves task-thread or control delivery uncertain, Nod does not retry that send. Ordinary replies remain available, but that thread can lack rich controls. Check Slack and use Nod's task controls instead.
 
 Task cards show the overall saved task state separately from plan intent. Structured plans list every entry as **Step 1**, **Step 2**, and so on, with **Pending** or **Started (reported)**. Descriptive step titles stay in Nod's ledger. Step outcomes are unverified: a reported start is not proof of continuous execution or an outside effect, and multiple steps can have reported starts. Legacy or invalid plan state is unknown; an empty structured plan says no entries were declared.

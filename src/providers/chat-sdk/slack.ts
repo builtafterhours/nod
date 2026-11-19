@@ -1060,6 +1060,7 @@ export function createSlackTransport(
                         ? 'Closed'
                         : 'Ready'),
             input.text,
+            input.status === 'processing' ? input.activity : '',
           ]
             .filter(Boolean)
             .join('\n');

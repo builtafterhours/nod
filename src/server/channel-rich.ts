@@ -490,10 +490,12 @@ export async function createChannelRich(
             ? row.nonce
             : randomUUID()
           : null;
+      const activity = desired === 'processing' ? await activityLine(row.turn_id) : '';
       const signature = JSON.stringify([
         row.turn_id,
         desired,
         nonce,
+        activity,
         desired === 'processing' ? Math.floor(Date.now() / (45 * 60_000)) : 0,
       ]);
       const key = `main:${row.turn_id}`;
@@ -522,7 +524,10 @@ export async function createChannelRich(
         const latest = await mainRoot(row.turn_id);
         if (!latest || latest.lifecycle_revision !== claim.lifecycle_revision) return false;
         if (row.current && !latest.current) return false;
-        return (await desiredStatus({ ...row, thread_id: row.dm }, row.root_id!)) === desired;
+        return (
+          (await desiredStatus({ ...row, thread_id: row.dm }, row.root_id!)) === desired &&
+          (desired !== 'processing' || (await activityLine(row.turn_id)) === activity)
+        );
       };
       try {
         const view = await options.transport().conversation?.({
@@ -536,6 +541,7 @@ export async function createChannelRich(
           status: desired,
           title: 'Nod',
           text: '',
+          activity,
           control: nonce ? { stop: nonce, status: claim.status_nonce } : undefined,
           outcome:
             turn.status === 'failed' || turn.status === 'cancelled' ? turn.status : undefined,
@@ -561,6 +567,25 @@ export async function createChannelRich(
         if (!signal.aborted) logFailure('channel_session_failed', cause);
       }
     }
+  }
+
+  async function activityLine(turnId: string) {
+    const row = (
+      await pool.query<{ summary: string }>(
+        `SELECT e.summary FROM turns u JOIN turn_events e ON e.turn_id=u.id
+         WHERE u.owner_id=$1 AND u.id=$2 AND u.status='running'
+           AND u.started_at<now()-interval '3 seconds' AND e.type='step'
+           AND NOT EXISTS (SELECT 1 FROM turn_events later WHERE later.turn_id=u.id
+             AND later.type IN ('step','steered','final') AND (later.created_at,later.id)>(e.created_at,e.id))
+         ORDER BY e.created_at DESC,e.id DESC LIMIT 1`,
+        [options.ownerId, turnId],
+      )
+    ).rows[0];
+    if (!row) return '';
+    const safe = options.safe(row.summary);
+    return safe.secureAction || safe.artifact
+      ? ''
+      : Array.from(safe.text.replace(/\s+/g, ' ').trim()).slice(0, 200).join('');
   }
 
   const controlSchema = z.object({
@@ -1128,11 +1153,13 @@ export async function createChannelRich(
                 : { kind: 'legacy', state: 'unknown' },
             }
           : undefined;
+        const activity = status === 'processing' ? await activityLine(row.turn_id) : '';
         const generation = revision;
         const signature = JSON.stringify([
           row.turn_id,
           status,
           text,
+          activity,
           nonce,
           task,
           row.revision,
@@ -1155,6 +1182,7 @@ export async function createChannelRich(
           status,
           title: options.safe(row.title).text.slice(0, 200) || 'Nod',
           text,
+          activity,
           control:
             nonce && binding.rows[0]?.status_nonce
               ? {
@@ -1167,6 +1195,8 @@ export async function createChannelRich(
           signal,
           current: (isCurrent = async () => {
             if (closed || signal.aborted || !permitted(row) || !rich() || revision !== generation)
+              return false;
+            if (status === 'processing' && (await activityLine(row.turn_id)) !== activity)
               return false;
             const current = await pool.query(
               `SELECT 1 FROM channel_roots r JOIN tasks t ON t.owner_id=r.owner_id AND t.session_id=r.session_id
