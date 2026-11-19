@@ -1,5 +1,5 @@
 import { parseMarkdown, type Root } from 'chat';
-import type { KnownBlock, RichTextText, RichTextLink } from '@slack/types';
+import type { KnownBlock, RichTextText, RichTextLink, TableBlock } from '@slack/types';
 
 type Node = Root | Root['children'][number];
 type Style = { bold?: boolean; italic?: boolean; strike?: boolean; code?: boolean };
@@ -133,7 +133,11 @@ function pack(units: SlackUnit[], native: boolean) {
     };
     if (
       current &&
-      (next.text.length > 3000 || (next.blocks?.length ?? 0) > 40 || bytes(next) > 30_000)
+      (next.text.length > 3000 ||
+        (next.blocks?.length ?? 0) > 40 ||
+        bytes(next) > 30_000 ||
+        (native &&
+          (unit.block.type === 'table' || current.blocks?.some((block) => block.type === 'table'))))
     ) {
       parts.push(current);
       current = undefined;
@@ -462,6 +466,83 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
             .map((s) => s.text)
             .join(''),
         );
+        if (
+          head.children.length <= 20 &&
+          head.children.length > 0 &&
+          rows.every((row) => row.children.length === head.children.length) &&
+          node.children.every((row) =>
+            row.children.every((cell) => exact(cell, source) && inline(cell).some((s) => s.text)),
+          )
+        ) {
+          const cell = (node: Node, bold = false): TableBlock['rows'][number][number] => ({
+            type: 'rich_text',
+            elements: [
+              {
+                type: 'rich_text_section',
+                elements: inline(node, bold ? { bold: true } : {}).map((span) =>
+                  span.url
+                    ? { type: 'link', url: span.url, text: span.text, style: span.style }
+                    : { type: 'text', text: span.text, style: span.style },
+                ),
+              },
+            ],
+          });
+          const header = head.children.map((node) => cell(node, true));
+          let pending: TableBlock['rows'] = [header];
+          const headerText = head.children
+            .map((node) =>
+              inline(node)
+                .map((span) => (span.url ? `${span.text} (${span.url})` : span.text))
+                .join(''),
+            )
+            .join(' | ');
+          let plain = headerText;
+          let finish = end(head);
+          const flush = () => {
+            const unit: SlackUnit = {
+              block: {
+                type: 'table',
+                rows: pending,
+                column_settings: head.children.map((_, index) => ({
+                  is_wrapped: true,
+                  align: node.align?.[index] ?? 'left',
+                })),
+              },
+              text: escape((units.length ? '\n\n' : '') + plain),
+              from: covered,
+              end: finish,
+            };
+            if (unit.text.length > 3000 || bytes(unit) > 18_000) throw new Error('native_budget');
+            units.push(unit);
+            covered = finish;
+            pending = [header];
+            plain = headerText;
+          };
+          for (const row of rows) {
+            const rendered = row.children.map((node) => cell(node));
+            const text = row.children
+              .map(
+                (node, index) =>
+                  `${labels[index]}: ${inline(node)
+                    .map((span) => (span.url ? `${span.text} (${span.url})` : span.text))
+                    .join('')}`,
+              )
+              .join('\n');
+            if (
+              pending.length > 1 &&
+              (pending.length >= 100 ||
+                escape(plain + '\n\n' + text).length > 2900 ||
+                bytes([...pending, rendered]) > 15_000)
+            )
+              flush();
+            pending.push(rendered);
+            plain += '\n\n' + text;
+            finish = end(row);
+          }
+          finish = end(node);
+          flush();
+          return;
+        }
         if (!rows.length) {
           emit(
             head.children.flatMap((cell, index) => [
@@ -525,7 +606,7 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
 }
 
 export function slackStreamParts(plan: SlackPlan) {
-  if (!plan.units.length) return;
+  if (!plan.units.length || plan.units.some((unit) => unit.block.type === 'table')) return;
   const parts: Array<{
     from: number;
     end: number;

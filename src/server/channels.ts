@@ -1595,7 +1595,9 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         generated = await presentChannelText(row.message_thread_id, input, options.present);
       }
       const visual = presentationSchema.safeParse(row.message_presentation);
-      const checked = visual.success ? channelText(presentationText(visual.data)) : undefined;
+      const checked = visual.success
+        ? channelText(presentationText(visual.data, row.provider === 'slack'))
+        : undefined;
       const fallback = checked && !checked.secureAction && !checked.artifact ? checked.text : '';
       const choices = answerChoicesSchema.safeParse(row.answer_choices);
       const question = generated ?? row.text;

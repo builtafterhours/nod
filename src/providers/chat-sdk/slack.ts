@@ -1457,11 +1457,12 @@ export function createSlackTransport(
                 if (typeof responseTs === 'string' && timestamp.test(responseTs))
                   ids.push(`${dm}:${responseTs}`);
                 if (
-                  part === 0 &&
-                  !ids.length &&
                   planned.blocks &&
                   error instanceof WebAPIPlatformError &&
                   !('ts' in error.data) &&
+                  !('message' in error.data) &&
+                  !error.data.warning &&
+                  !error.data.response_metadata?.warnings?.length &&
                   ['invalid_blocks', 'invalid_blocks_format'].includes(error.data.error)
                 ) {
                   textBlocksUnsupported = true;
@@ -1472,8 +1473,10 @@ export function createSlackTransport(
             }),
           );
           if (!result) {
-            parts = rendered.plain;
-            part = -1;
+            parts = parts.map((planned, index) =>
+              index < part ? planned : { ...planned, blocks: undefined },
+            );
+            part--;
             continue;
           }
           if (!result.ts || !timestamp.test(result.ts))
