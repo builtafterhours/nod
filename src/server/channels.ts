@@ -238,29 +238,32 @@ function localHost(hostname: string) {
   );
 }
 
-function addresses(value: string) {
-  const found: string[] = [];
-  const add = (token: string) => {
-    found.push(token);
-    for (let index = 1; index < token.length; index++)
-      if (urlEnd.test(token[index])) found.push(token.slice(0, index));
+function addresses(values: Array<[string, boolean]>, check: (candidate: string) => void) {
+  let budget = 10_000;
+  const token = /\S{0,2049}/y;
+  const inspect = (value: string, from: number) => {
+    token.lastIndex = from;
+    const found = token.exec(value)![0];
+    if (found.length > 2048) return false;
+    const cuts = [found.length];
+    for (let index = 1; index < found.length; index++)
+      if (urlEnd.test(found[index])) cuts.push(index);
+    if (cuts.length > 65 || (budget -= cuts.length) < 0) return false;
+    for (const cut of cuts) check(found.slice(0, cut));
+    return true;
   };
-  for (const match of value.matchAll(/:\/\//g)) {
-    const scheme = /[a-z][a-z0-9+.-]*$/i.exec(
-      value.slice(Math.max(0, match.index - 32), match.index),
-    );
-    if (!scheme) continue;
-    const from = match.index - scheme[0].length;
-    const token = /^\S{0,2048}/.exec(value.slice(from))![0];
-    add(token);
-    const web = /https?$/i.exec(scheme[0]);
-    if (web && web.index) add(token.slice(web.index));
+  for (const [value, paths] of values) {
+    for (const match of value.matchAll(/:[/\\]{2}/g)) {
+      const scheme = /https?$/i.exec(value.slice(Math.max(0, match.index - 5), match.index));
+      if (scheme && !inspect(value, match.index - scheme[0].length)) return false;
+    }
+    if (paths)
+      for (const match of value.matchAll(
+        /(?<![\w.:/%@-])\/(?:api\/artifacts|vault|trust|browser|credentials|payments|approvals)/gi,
+      ))
+        if (!inspect(value, match.index)) return false;
   }
-  for (const match of value.matchAll(
-    /(?<![\w.:/%@-])\/(?:api\/artifacts|vault|trust|browser|credentials|payments|approvals)\S{0,2048}/gi,
-  ))
-    add(match[0]);
-  return found;
+  return true;
 }
 
 function channelText(text: string) {
@@ -273,7 +276,14 @@ function channelText(text: string) {
     } catch {
       return false;
     }
-    if (url.pathname.startsWith('/api/artifacts/')) {
+    let path = url.pathname;
+    try {
+      path = decodeURIComponent(path);
+    } catch {
+      secureAction = true;
+      return true;
+    }
+    if (path.startsWith('/api/artifacts/')) {
       artifact = true;
       return true;
     }
@@ -282,9 +292,9 @@ function channelText(text: string) {
       return true;
     }
     if (
-      /^\/(?:vault|credentials|payments|approvals)\//.test(url.pathname) ||
-      url.pathname === '/browser' ||
-      (['/vault', '/trust'].includes(url.pathname) && url.searchParams.has('add'))
+      /^\/(?:vault|credentials|payments|approvals)\//.test(path) ||
+      path === '/browser' ||
+      (['/vault', '/trust'].includes(path) && url.searchParams.has('add'))
     ) {
       if (!/^https?:\/\//.test(value)) {
         secureAction = true;
@@ -310,17 +320,18 @@ function channelText(text: string) {
       (url) => (privateUrl(url) ? '' : url),
     )
     .trim();
-  const values = [safe];
+  const values: Array<[string, boolean]> = [[safe, false]];
   const walk = (node: Nodes) => {
-    if ('url' in node) values.push(node.url);
-    if ('value' in node) values.push(node.value);
-    if ('alt' in node && node.alt) values.push(node.alt);
+    if ('url' in node) {
+      values.push([node.url, true]);
+      privateUrl(node.url);
+    }
+    if (node.type === 'text') values.push([node.value, true]);
+    if ('alt' in node && node.alt) values.push([node.alt, true]);
     if ('children' in node) for (const child of node.children) walk(child);
   };
   walk(markdown.parse(safe));
-  const found = values.flatMap(addresses);
-  if (found.length > 5_000) secureAction = true;
-  else for (const value of found) privateUrl(value);
+  if (!addresses(values, privateUrl)) secureAction = true;
   return { text: safe, secureAction, artifact };
 }
 
@@ -353,7 +364,9 @@ export async function channelReply(
   },
 ) {
   const safe = channelText(text);
-  const fallback = options.fallbackText ? channelText(options.fallbackText).text : '';
+  const checked = options.fallbackText ? channelText(options.fallbackText) : undefined;
+  const fallback = checked && !checked.secureAction && !checked.artifact ? checked.text : '';
+  if (checked && !fallback) safe.secureAction ||= checked.secureAction || checked.artifact;
   safe.secureAction ||= options.browserHandoff === true;
   const attachments = options.deliversAttachments
     ? 'pending'
@@ -1586,7 +1599,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         generated = await presentChannelText(row.message_thread_id, input, options.present);
       }
       const visual = presentationSchema.safeParse(row.message_presentation);
-      const fallback = visual.success ? channelText(presentationText(visual.data)).text : '';
+      const checked = visual.success ? channelText(presentationText(visual.data)) : undefined;
+      const fallback = checked && !checked.secureAction && !checked.artifact ? checked.text : '';
       const choices = answerChoicesSchema.safeParse(row.answer_choices);
       const question = generated ?? row.text;
       text = await channelReply(
@@ -1595,7 +1609,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           threadId: row.message_thread_id,
           hasAttachments: !row.presentation && Boolean(row.attachments?.length),
           deliversAttachments: !row.presentation && Boolean(attachments),
-          browserHandoff: row.browser_handoff,
+          browserHandoff:
+            row.browser_handoff || Boolean(checked && (checked.secureAction || checked.artifact)),
           present: options.present,
           fallbackText: fallback,
         },
