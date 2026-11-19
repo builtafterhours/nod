@@ -62,6 +62,9 @@ function literal(source: string): SlackPart[] {
   return parts;
 }
 
+const linkable = (url: string) =>
+  /^(?:https?:\/\/|mailto:|tel:)[^\s()]+$/.test(url) && !/&(?:#|[a-z][a-z0-9]*;)/i.test(url);
+
 function exact(node: Node, source: string) {
   const parents = new Set(['paragraph', 'heading', 'tableCell', 'strong', 'emphasis', 'delete']);
   let count = 0;
@@ -87,7 +90,8 @@ function exact(node: Node, source: string) {
     }
     if (node.type === 'image')
       return (
-        /^https?:\/\/\S+$/.test(node.url) &&
+        /^https?:\/\//.test(node.url) &&
+        linkable(node.url) &&
         !node.title &&
         raw === `![${node.alt ?? ''}](${node.url})`
       );
@@ -101,9 +105,8 @@ function exact(node: Node, source: string) {
           /^\S+$/.test(raw)
         );
       if (
-        !/^(https?:\/\/|mailto:|tel:)/.test(node.url) ||
+        !linkable(node.url) ||
         node.title ||
-        /\s/.test(node.url) ||
         node.children.some((child) => child.type !== 'text') ||
         !raw.endsWith(`](${node.url})`)
       )
@@ -221,7 +224,7 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
       if (node.type === 'link' && !source.startsWith('[', start(node))) {
         const raw = source.slice(start(node), end(node));
         return [
-          /^https?:\/\//.test(raw) && node.url === raw
+          /^https?:\/\//.test(raw) && node.url === raw && linkable(raw)
             ? { text: raw, url: raw, style, end: end(node) }
             : { text: raw, style, from: start(node), end: end(node) },
         ];
@@ -394,9 +397,11 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
         const pad = start(node) - lineStart;
         if (/[^ ]/.test(source.slice(lineStart, start(node)))) throw new Error('native_shape');
         const lines = source.slice(start(node), end(node)).split('\n');
-        if (lines.slice(1).some((line) => line && !line.startsWith(' '.repeat(pad))))
-          throw new Error('native_shape');
-        const raw = lines.map((line, index) => (index ? line.slice(pad) : line)).join('\n');
+        const raw = lines
+          .map((line, index) =>
+            index ? line.slice(Math.min(pad, /^ */.exec(line)![0].length)) : line,
+          )
+          .join('\n');
         const match = /^(`{3,}|~{3,})([\w#+.-]*)\n([\s\S]*?)\n\1$/.exec(raw);
         if (
           !match ||
