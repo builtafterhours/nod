@@ -1110,7 +1110,9 @@ export function createSlackTransport(
             updateRichError();
             return {};
           }
-          if (!input.task && input.status === 'active' && !input.outcome) {
+          const workingChat = !input.task && !input.outcome && input.status === 'processing';
+          const spinnerOnly = workingChat && !input.control && !input.text && !input.activity;
+          if ((!input.task && input.status === 'active' && !input.outcome) || spinnerOnly) {
             if (input.current && !(await input.current())) return {};
             if (previous?.provider_id) {
               try {
@@ -1143,8 +1145,6 @@ export function createSlackTransport(
             updateRichError();
             return {};
           }
-          const workingChatControls =
-            !input.task && !input.outcome && input.status === 'processing' && input.control;
           const state =
             input.outcome === 'failed'
               ? 'Failed'
@@ -1158,9 +1158,7 @@ export function createSlackTransport(
                       ? 'Closed'
                       : 'Ready';
           const header = [
-            ...(workingChatControls
-              ? []
-              : [input.title, (input.task ? 'Overall task: ' : '') + state]),
+            ...(workingChat ? [] : [input.title, (input.task ? 'Overall task: ' : '') + state]),
             input.text,
             input.status === 'processing' ? input.activity : '',
           ]
