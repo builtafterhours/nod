@@ -22,6 +22,10 @@ import type {
   MessagingTransport,
 } from '../ports/messaging.ts';
 import { loopbackHost } from '../shared/loopback.ts';
+import type { Nodes } from 'mdast';
+import remarkGfm from 'remark-gfm';
+import remarkParse from 'remark-parse';
+import { unified } from 'unified';
 import type { ChatConfirmationInput } from './approvals.ts';
 import { appPagePath, appPages, appPageUrl } from '../shared/app-links.ts';
 import { pendingAnswerChoicesSql } from './answer-choices.ts';
@@ -219,6 +223,46 @@ function inboundMessageId(ownerId: string, sourceId: string) {
   return `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`;
 }
 
+const markdown = unified().use(remarkParse).use(remarkGfm);
+const urlEnd = /[)<>"'\]|`{}^*_~,.;:!?]/;
+
+function localHost(hostname: string) {
+  const host = hostname.toLowerCase().replace(/\.$/, '');
+  return (
+    loopbackHost(host) ||
+    host === '0.0.0.0' ||
+    host === '[::]' ||
+    host.endsWith('.localhost') ||
+    /^127\.\d+\.\d+\.\d+$/.test(host) ||
+    /^\[::ffff:(?:7f[0-9a-f]{2}:|127\.)/.test(host)
+  );
+}
+
+function addresses(value: string) {
+  const found: string[] = [];
+  const add = (token: string) => {
+    found.push(token);
+    for (let index = 1; index < token.length; index++)
+      if (urlEnd.test(token[index])) found.push(token.slice(0, index));
+  };
+  for (const match of value.matchAll(/:\/\//g)) {
+    const scheme = /[a-z][a-z0-9+.-]*$/i.exec(
+      value.slice(Math.max(0, match.index - 32), match.index),
+    );
+    if (!scheme) continue;
+    const from = match.index - scheme[0].length;
+    const token = /^\S{0,2048}/.exec(value.slice(from))![0];
+    add(token);
+    const web = /https?$/i.exec(scheme[0]);
+    if (web && web.index) add(token.slice(web.index));
+  }
+  for (const match of value.matchAll(
+    /(?<![\w.:/%@-])\/(?:api\/artifacts|vault|trust|browser|credentials|payments|approvals)\S{0,2048}/gi,
+  ))
+    add(match[0]);
+  return found;
+}
+
 function channelText(text: string) {
   let secureAction = false;
   let artifact = false;
@@ -233,7 +277,7 @@ function channelText(text: string) {
       artifact = true;
       return true;
     }
-    if (loopbackHost(url.hostname)) {
+    if (localHost(url.hostname)) {
       secureAction = true;
       return true;
     }
@@ -264,8 +308,20 @@ function channelText(text: string) {
     .replace(
       /https?:\/\/[^\s)]+|\/(?:api\/artifacts|vault|trust|browser|credentials|payments|approvals)[^\s)]*/g,
       (url) => (privateUrl(url) ? '' : url),
-    );
-  return { text: safe.trim(), secureAction, artifact };
+    )
+    .trim();
+  const values = [safe];
+  const walk = (node: Nodes) => {
+    if ('url' in node) values.push(node.url);
+    if ('value' in node) values.push(node.value);
+    if ('alt' in node && node.alt) values.push(node.alt);
+    if ('children' in node) for (const child of node.children) walk(child);
+  };
+  walk(markdown.parse(safe));
+  const found = values.flatMap(addresses);
+  if (found.length > 5_000) secureAction = true;
+  else for (const value of found) privateUrl(value);
+  return { text: safe, secureAction, artifact };
 }
 
 async function presentChannelText(

@@ -285,6 +285,8 @@ The Channels page checks status every five seconds while visible. During Telegra
 
 Passwords, saved logins, app sign-ins and payment approvals never go through a chat app. When a task started on Telegram or WhatsApp needs one, Nod asks you to open Nod. Finish the step there, and the task carries on and replies in the chat app.
 
+Links to this computer and to Nod's private pages stay out of chat apps too. Nod removes the ones it finds. It also checks each link, image and address the way Markdown reads it, with encoded characters decoded. If one points to this computer (`localhost`, `127.0.0.1` and similar local addresses) or to a private Nod page, the chat app gets a short note to open Nod instead of the reply.
+
 ```mermaid
 sequenceDiagram
   actor You
