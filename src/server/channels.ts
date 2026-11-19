@@ -195,6 +195,7 @@ const messageSchema = z
     sentAt: z.date(),
     replyToMessageId: z.string().min(1).optional(),
     conversationRootMessageId: z.string().min(1).max(100).optional(),
+    mediaIntakeThreadId: z.uuid().optional(),
     installationId: z.string().min(1).max(100).optional(),
   })
   .refine((message) => Boolean(message.text || message.attachments?.length));
@@ -674,8 +675,10 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       const hasMedia = Boolean(parsed.data.attachments?.length);
       const modelMissingAtIntake = hasMedia && options.modelConfigured?.() === false;
       if (recorded && hasMedia) return;
+      const stagedThreadId = channelId === 'slack' ? parsed.data.mediaIntakeThreadId : undefined;
       const mediaThreadId = hasMedia
-        ? (await transaction(async (client) => options.activeThread?.(client), pool))?.id
+        ? (stagedThreadId ??
+          (await transaction(async (client) => options.activeThread?.(client), pool))?.id)
         : undefined;
       async function currentConversation(client: PoolClient) {
         if (!mediaThreadId || (await options.activeThread?.(client))?.id === mediaThreadId)
@@ -698,6 +701,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         return false;
       }
       if (closed || replacing || receiveSignal.aborted || !permitted(identity)) return;
+      if (hasMedia && stagedThreadId && !(await transaction(currentConversation, pool))) return;
       const requestModelSetup = async () => {
         await transaction(async (client) => {
           if (!(await currentConversation(client))) return;

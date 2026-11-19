@@ -668,6 +668,11 @@ export function createDefaultAdapters(
       managed: managedChannelEnvironment(env),
       create: (environment) => {
         const configured = { ...env, ...environment };
+        const slack = createSlackTransport(pool, configured, {
+          ownerId,
+          keyStore,
+          captureThread: async () => (await activeThread(pool, ownerId)).id,
+        });
         const mode =
           environment.WHATSAPP_MODE ??
           (environment.WHATSAPP_ENABLED === 'true' && environment.WHATSAPP_ACCESS_TOKEN
@@ -679,13 +684,10 @@ export function createDefaultAdapters(
           (mode !== 'bot' && mode !== 'self-chat') ||
           (mode === 'bot' && !/^\d{7,15}$/.test(configured.WHATSAPP_ALLOWED_NUMBER ?? ''))
         )
-          return combineMessagingTransports(
-            createChatSdkTransport(pool, configured),
-            createSlackTransport(pool, configured),
-          );
+          return combineMessagingTransports(createChatSdkTransport(pool, configured), slack);
         return combineMessagingTransports(
           createChatSdkTransport(pool, { ...configured, WHATSAPP_ENABLED: 'false' }),
-          createSlackTransport(pool, configured),
+          slack,
           createWhatsAppLinkedTransport({
             mode,
             allowedNumber: configured.WHATSAPP_ALLOWED_NUMBER,

@@ -12,6 +12,8 @@ import {
 import { get as emojiForName, which as nameForEmoji } from 'node-emoji';
 import type { Pool } from 'pg';
 import { z } from 'zod';
+import type { CredentialKeyStore } from '../../ports/key-store.ts';
+import { logRepeatedFailure } from '../../ports/failure-log.ts';
 import type {
   InboundMessage,
   InboundReaction,
@@ -27,6 +29,7 @@ import {
   MessagingDeliveryError,
 } from '../../ports/messaging.ts';
 import { isMessageReaction } from '../../shared/emoji.ts';
+import { createSlackIntake } from './slack-intake.ts';
 import {
   slackPlan,
   slackStreamParts,
@@ -37,6 +40,7 @@ import {
 const id = /^[A-Z][A-Z0-9]{1,63}$/;
 const timestamp = /^\d{10,16}\.\d{6}$/;
 const fileLimit = 20 * 1024 * 1024;
+const messageMediaLimit = 50 * 1024 * 1024;
 const emojiAliases: Record<string, string> = {
   thinking_face: 'thinking',
   hugging_face: 'hugs',
@@ -369,6 +373,23 @@ const eventSchema = z.object({
       .optional(),
   }),
 });
+type SlackEvent = z.infer<typeof eventSchema>['event'];
+type StagedFile = Pick<MessagingAttachment, 'name' | 'mimeType' | 'size' | 'voice'> &
+  (
+    | { bytes: Uint8Array }
+    | { limit: number }
+    | {
+        reason: MessagingAttachmentReadError['reason'];
+        httpStatus?: number;
+        serviceCode?: MessagingAttachmentReadError['serviceCode'];
+      }
+  );
+type StagedMessage = {
+  threadId: string;
+  text?: string;
+  threadTs?: string;
+  files: StagedFile[];
+};
 
 function fileUrl(value: string | undefined, upload = false) {
   let url: URL;
@@ -394,6 +415,7 @@ function fileUrl(value: string | undefined, upload = false) {
 export function createSlackTransport(
   pool: Pool,
   environment: Record<string, string | undefined>,
+  options: { ownerId: string; keyStore: CredentialKeyStore; captureThread(): Promise<string> },
 ): MessagingTransport {
   const parsed = slackInput.safeParse({
     botToken: environment.SLACK_BOT_TOKEN,
@@ -583,6 +605,9 @@ export function createSlackTransport(
     { body: z.infer<typeof eventSchema>; ack: () => Promise<void> }
   >();
   const active = new Set<Promise<unknown>>();
+  const intake = createSlackIntake<StagedMessage>(pool, options.ownerId, options.keyStore);
+  const staging = new Map<string, { ack(): Promise<void> }>();
+  let nextIntakePrune = 0;
   let ready: Promise<unknown> | undefined;
   const table = () =>
     (ready ??= pool
@@ -727,6 +752,87 @@ export function createSlackTransport(
       Date.now() + Math.max(Math.min(30_000, 2000 * 2 ** (attempts - 1)), retryAfter(error));
   }
 
+  const sourceId = (dm: string, ts: string) => `channel:slack:${channel.accountId}:${dm}:${ts}`;
+
+  function stage(
+    event: SlackEvent & { ts: string },
+    scope: string,
+    dm: string,
+    ack: () => Promise<void>,
+  ) {
+    const key = `${scope}:${event.ts}`;
+    const previous = staging.get(key);
+    if (previous) {
+      previous.ack = ack;
+      return;
+    }
+    if (staging.size >= 2) return;
+    const current = { ack };
+    staging.set(key, current);
+    const signal = lifetime.signal;
+    const pending = (async () => {
+      if (!(await intake.known(scope, event.ts, sourceId(dm, event.ts)))) {
+        const threadId = await options.captureThread();
+        const files: StagedFile[] = [];
+        let total = 0;
+        for (const file of event.files ?? []) {
+          signal.throwIfAborted();
+          const { name, mimeType, size, voice, read } = await incomingAttachment(file);
+          const metadata = { name, mimeType, size, ...(voice ? { voice } : {}) };
+          try {
+            if (size > messageMediaLimit) throw new MessagingAttachmentError(messageMediaLimit);
+            const bytes = await read(signal);
+            total += bytes.length;
+            if (total > messageMediaLimit) throw new MessagingAttachmentError(messageMediaLimit);
+            files.push({ ...metadata, bytes });
+          } catch (error) {
+            signal.throwIfAborted();
+            files.length = 0;
+            files.push(
+              error instanceof MessagingAttachmentError
+                ? { ...metadata, size: 0, limit: error.maxBytes }
+                : error instanceof MessagingAttachmentReadError
+                  ? {
+                      ...metadata,
+                      reason: error.reason,
+                      httpStatus: error.httpStatus,
+                      serviceCode: error.serviceCode,
+                    }
+                  : { ...metadata, reason: 'download_failed' },
+            );
+            break;
+          }
+        }
+        await intake.save(
+          scope,
+          event.ts,
+          {
+            threadId,
+            text: event.text,
+            threadTs: event.thread_ts,
+            files,
+          },
+          signal,
+        );
+      }
+      staging.delete(key);
+      if (!signal.aborted) await current.ack().catch(() => {});
+    })()
+      .catch((error) => {
+        if (!signal.aborted)
+          logRepeatedFailure(
+            'slack_attachment_stage_failed',
+            'slack_attachment_stage_failed',
+            error instanceof MessagingConnectionError ? error : undefined,
+          );
+      })
+      .finally(() => {
+        if (staging.get(key) === current) staging.delete(key);
+        active.delete(pending);
+      });
+    active.add(pending);
+  }
+
   function start() {
     if (closed || !parsed.success || !enabled || starting || terminal || Date.now() < nextAttempt)
       return;
@@ -808,6 +914,19 @@ export function createSlackTransport(
               !['message', 'reaction_added', 'reaction_removed'].includes(event.type)
             ) {
               void ack().catch(() => {});
+              return;
+            }
+            if (event.type === 'message' && event.files?.length) {
+              if (
+                !event.ts ||
+                !timestamp.test(event.ts) ||
+                (event.thread_ts && !timestamp.test(event.thread_ts)) ||
+                Number(event.ts) * 1000 > Date.now() + 300_000
+              ) {
+                void ack().catch(() => {});
+                return;
+              }
+              stage({ ...event, ts: event.ts }, `${installation()}:${dm}`, dm, ack);
               return;
             }
             if (incoming.size < 100 || incoming.has(value.data.event_id))
@@ -1056,6 +1175,56 @@ export function createSlackTransport(
       }
       throw new MessagingDeliveryError(failure(error).message, ids);
     }
+  }
+
+  function message(
+    event: { ts: string; text?: string; thread_ts?: string },
+    staged?: StagedMessage,
+  ): InboundMessage {
+    const dm = verified!.dmId;
+    const text = (event.text ?? '')
+      .replace(/<((?:https?:\/\/|mailto:)[^>|]+)(?:\|([^>]+))?>/g, (_, url, label) =>
+        label ? `[${label}](${url})` : url,
+      )
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>')
+      .replaceAll('&amp;', '&');
+    const command = /^nod\s+(usage|memory|tasks|status|stop)$/i.exec(text.trim());
+    return {
+      channelId: 'slack',
+      accountId: channel.accountId!,
+      senderId: channel.allowedSenderIds[0],
+      messageId: `${dm}:${event.ts}`,
+      threadId: dm,
+      installationId: installation(),
+      conversationRootMessageId: `${dm}:${event.thread_ts ?? event.ts}`,
+      text: command ? `/${command[1].toLowerCase()}` : text,
+      sentAt: new Date(Number(event.ts) * 1000),
+      ...(event.thread_ts && event.thread_ts !== event.ts
+        ? { replyToMessageId: `${dm}:${event.thread_ts}` }
+        : {}),
+      ...(staged
+        ? {
+            mediaIntakeThreadId: staged.threadId,
+            attachments: staged.files.map((file) => ({
+              name: file.name,
+              mimeType: file.mimeType,
+              size: file.size,
+              voice: file.voice,
+              async read(signal?: AbortSignal) {
+                signal?.throwIfAborted();
+                if ('bytes' in file) return file.bytes;
+                if ('limit' in file) throw new MessagingAttachmentError(file.limit);
+                throw new MessagingAttachmentReadError(
+                  file.reason,
+                  file.httpStatus,
+                  file.serviceCode,
+                );
+              },
+            })),
+          }
+        : {}),
+    };
   }
 
   return {
@@ -1394,6 +1563,32 @@ export function createSlackTransport(
     async poll(accept, _pair, react) {
       if (!enabled || !parsed.success || closed) return;
       start();
+      const dm = channel.available ? verified?.dmId : undefined;
+      const scope = dm ? `${installation()}:${dm}` : undefined;
+      if (scope) {
+        if (Date.now() >= nextIntakePrune) {
+          await intake.prune();
+          nextIntakePrune = Date.now() + 60_000;
+        }
+        if (staging.size) return;
+      }
+      async function resume(before?: string) {
+        if (!scope || !dm) return true;
+        if (staging.size) return false;
+        for (let count = 0; count < 8; count++) {
+          const queued = await intake.next(scope, before);
+          if (!queued) break;
+          if (closed || !channel.available || `${installation()}:${verified?.dmId}` !== scope)
+            return false;
+          const input = message(
+            { ts: queued.ts, text: queued.value.text, thread_ts: queued.value.threadTs },
+            queued.value,
+          );
+          await accept(input);
+          if (!(await intake.complete(scope, queued.ts, sourceId(dm, queued.ts)))) return false;
+        }
+        return true;
+      }
       for (const [key, item] of incoming) {
         if (closed) return;
         const event = item.body.event;
@@ -1402,33 +1597,8 @@ export function createSlackTransport(
           timestamp.test(event.ts ?? '') &&
           (!event.thread_ts || timestamp.test(event.thread_ts))
         ) {
-          const text = (event.text ?? '')
-            .replace(/<((?:https?:\/\/|mailto:)[^>|]+)(?:\|([^>]+))?>/g, (_, url, label) =>
-              label ? `[${label}](${url})` : url,
-            )
-            .replaceAll('&lt;', '<')
-            .replaceAll('&gt;', '>')
-            .replaceAll('&amp;', '&');
-          const command = /^nod\s+(usage|memory|tasks|status|stop)$/i.exec(text.trim());
-          const attachments = event.files?.length
-            ? await Promise.all(event.files.map(incomingAttachment))
-            : undefined;
-          if (closed) return;
-          await accept({
-            channelId: 'slack',
-            accountId: parsed.data.teamId,
-            senderId: parsed.data.allowedUserId,
-            messageId: `${verified!.dmId}:${event.ts}`,
-            threadId: verified!.dmId,
-            installationId: installation(),
-            conversationRootMessageId: `${verified!.dmId}:${event.thread_ts ?? event.ts}`,
-            text: command ? `/${command[1].toLowerCase()}` : text,
-            sentAt: new Date(Number(event.ts) * 1000),
-            ...(event.thread_ts && event.thread_ts !== event.ts
-              ? { replyToMessageId: `${verified!.dmId}:${event.thread_ts}` }
-              : {}),
-            ...(attachments ? { attachments } : {}),
-          } satisfies InboundMessage);
+          if (!(await resume(event.ts))) return;
+          await accept(message({ ...event, ts: event.ts! }));
         } else if (react && event.item?.type === 'message' && event.reaction && event.event_ts) {
           const emoji = reactionEmoji(event.reaction);
           if (isMessageReaction(emoji)) {
@@ -1501,6 +1671,7 @@ export function createSlackTransport(
         await item.ack().catch(() => {});
         incoming.delete(key);
       }
+      await resume();
     },
     async receive() {
       return { status: 404, body: { error: 'Slack Socket Mode does not use a webhook.' } };

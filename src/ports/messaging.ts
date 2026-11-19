@@ -85,6 +85,7 @@ export interface InboundMessage {
   attachments?: MessagingAttachment[];
   replyToMessageId?: string;
   conversationRootMessageId?: string;
+  mediaIntakeThreadId?: string;
   installationId?: string;
   sentAt: Date;
 }
