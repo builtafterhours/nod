@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { join, win32 } from 'node:path';
 
 const rate = 16_000;
 const maxPcmBytes = 300 * rate * 2;
@@ -12,6 +12,23 @@ export class LocalMediaDecodeError extends Error {
   constructor(readonly reason: 'decode' | 'length' | 'format') {
     super('Local media conversion failed.');
   }
+}
+
+export function slackDecoderProcess(platform: NodeJS.Platform, environment: NodeJS.ProcessEnv) {
+  if (platform !== 'win32')
+    return {
+      candidates: ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'],
+      env: { LANG: 'C' },
+    };
+  const systemRoot = environment.SystemRoot ?? environment.SYSTEMROOT;
+  return {
+    candidates: (environment.PATH ?? environment.Path ?? '')
+      .split(win32.delimiter)
+      .map((entry) => entry.trim().replace(/^"(.*)"$/, '$1'))
+      .filter((entry) => /^[a-z]:[\\/]/i.test(entry))
+      .map((entry) => win32.join(entry, 'ffmpeg.exe')),
+    env: { LANG: 'C', ...(systemRoot ? { SystemRoot: systemRoot } : {}) },
+  };
 }
 
 export async function prepareSlackSpeech(
@@ -50,14 +67,7 @@ export async function prepareSlackSpeech(
   else throw new LocalMediaDecodeError('format');
   signal.throwIfAborted();
   let executable: string | undefined;
-  const candidates =
-    process.platform === 'win32'
-      ? (process.env.PATH ?? '')
-          .split(delimiter)
-          .map((entry) => entry.replace(/^"|"$/g, '').trim())
-          .filter((entry) => /^[a-z]:[\\/]/i.test(entry))
-          .map((entry) => join(entry, 'ffmpeg.exe'))
-      : ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'];
+  const { candidates, env } = slackDecoderProcess(process.platform, process.env);
   for (const candidate of candidates) {
     if (
       await access(candidate, constants.X_OK).then(
@@ -121,10 +131,7 @@ export async function prepareSlackSpeech(
           ],
           {
             stdio: [file.fd, 'pipe', 'pipe'],
-            env: {
-              LANG: 'C',
-              ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot } : {}),
-            },
+            env,
             signal: operation,
             killSignal: 'SIGKILL',
             windowsHide: true,
