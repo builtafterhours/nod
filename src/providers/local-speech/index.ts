@@ -198,7 +198,11 @@ export function createLocalSpeechProvider(options: {
           finished.reject(
             reply.reason === 'silence' || reply.reason === 'length' || reply.reason === 'format'
               ? new LocalSpeechInputError(reply.reason)
-              : new SpeechProviderError('Local speech failed. Try again.'),
+              : new SpeechProviderError(
+                  reply.reason === 'tokens'
+                    ? "This text exceeds the local voice's pronunciation limit. Try a shorter passage or a voice service that supports its language."
+                    : 'Local speech failed. Try again.',
+                ),
           );
         }
         advance();

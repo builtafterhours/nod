@@ -1114,6 +1114,88 @@ test('retired confirmation replies require high confidence to start a new reques
   }
 });
 
+test('repeated actions require an action-specific decision with high confidence', async () => {
+  let output: unknown;
+  const input = {
+    action: 'CONNECTED_MCP_CALL',
+    args: { tool: 'execute_workflow', input: { workflowId: 'synthetic-workflow' } },
+    reply: 'Set the threshold to 7 and run the synthetic workflow again.',
+    question: 'Which threshold should I use?',
+  };
+  const controller = new AbortController();
+  let receivedSignal: AbortSignal | undefined;
+  const trust = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async (instructions, received, signal, question) => {
+      assert.deepEqual(received, input);
+      assert.match(instructions, /never permits execution/);
+      assert.equal(question?.name, 'repeatedAction');
+      assert.deepEqual(
+        question?.choices.map(({ value }) => value),
+        ['new', 'same'],
+      );
+      receivedSignal = signal;
+      return output;
+    },
+  });
+  for (const [answer, expected] of [
+    [{ repeatedAction: 'new', probability: 0.98 }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: '0.995' }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: Number.NaN }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: Number.POSITIVE_INFINITY }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: 1.1 }, 'uncertain'],
+    [{ repeatedAction: 'new' }, 'uncertain'],
+    [{ repeatedAction: 'wrong', probability: 1 }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: 0.995 }, 'new'],
+    [{ repeatedAction: 'same', probability: 0.995 }, 'same'],
+  ] as const) {
+    output = answer;
+    assert.equal(await trust.classifyRepeatedAction(input, controller.signal), expected);
+  }
+  assert.ok(receivedSignal);
+  assert.notEqual(receivedSignal, controller.signal);
+  assert.equal(receivedSignal.aborted, false);
+  controller.abort();
+  assert.equal(receivedSignal.aborted, true);
+});
+
+test('repeated action decisions keep their confidence threshold and refuse a late stopped answer', async () => {
+  const input = {
+    action: 'CONNECTED_MCP_CALL',
+    args: { tool: 'execute_workflow' },
+    reply: 'Run it again.',
+    question: 'Another run?',
+  };
+  const controller = new AbortController();
+  const stopped = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      controller.abort(new Error('Synthetic Stop.'));
+      return { repeatedAction: 'new', probability: 1 };
+    },
+  });
+  await assert.rejects(stopped.classifyRepeatedAction(input, controller.signal), /Synthetic Stop/);
+  const decisions = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      assert.fail('A selected decision provider must not fall back.');
+    },
+    decisions: {
+      check: async ({ input: received, question }, signal) => {
+        assert.deepEqual(received, input);
+        assert.equal(question.name, 'repeatedAction');
+        assert.equal(question.minProbability, 0.99);
+        assert.ok(signal);
+        return { repeatedAction: 'new', probability: 0.995 };
+      },
+    },
+  });
+  assert.equal(await decisions.classifyRepeatedAction(input), 'new');
+});
+
 test('native decision probabilities validate the wire type and retain refusal and cache costs', async (t) => {
   for (const provider of ['openai', 'typesafe', 'openrouter'] as const)
     await t.test(provider, async () => {
@@ -1867,6 +1949,7 @@ describe('account routes', () => {
       delivered.push(trace);
     }, '0.3.0');
     traces.configure({
+      userId: `local:${randomUUID()}`,
       secrets: ['fixture-model-key-8c41f2'],
       profile: async () => ({ names: ['Marta Vidal'], region: 'ES' }),
     });
@@ -1936,10 +2019,9 @@ describe('account routes', () => {
     await settle(1);
     assert.equal(delivered.length, 1);
     const sent = JSON.stringify(delivered[0]);
-    const privateContent = [delivered[0].metadata.thread_id, delivered[0].metadata.turn_id].reduce(
-      (text, id) => text.replaceAll(id, '[id]'),
-      sent,
-    );
+    const privateContent = [delivered[0].metadata.thread_id, delivered[0].metadata.turn_id]
+      .map(String)
+      .reduce((text, id) => text.replaceAll(id, '[id]'), sent);
     for (const value of [
       'Marta',
       'Vidal',
@@ -1962,10 +2044,15 @@ describe('account routes', () => {
       assert.ok(!privateContent.includes(value), value);
     assert.match(sent, /order 123456 on 2026-10-19/);
     assert.match(sent, /192\.168\.1\.1\.example/);
-    assert.deepEqual(Object.keys(delivered[0].metadata), ['turn_id', 'thread_id', 'app_version']);
+    assert.deepEqual(Object.keys(delivered[0].metadata), [
+      'turn_id',
+      'thread_id',
+      'user_id',
+      'app_version',
+    ]);
     assert.equal(delivered[0].metadata.app_version, '0.3.0');
-    assert.match(delivered[0].metadata.thread_id, /^[0-9a-f]{32}$/);
-    assert.match(delivered[0].metadata.turn_id, /^[0-9a-f]{32}$/);
+    assert.match(String(delivered[0].metadata.thread_id), /^[0-9a-f]{32}$/);
+    assert.match(String(delivered[0].metadata.turn_id), /^[0-9a-f]{32}$/);
     assert.ok(!sent.includes('fixture-session') && !sent.toLowerCase().includes(turnId));
     assert.ok(sent.includes(`task ${delivered[0].metadata.turn_id}`));
     assert.ok(!sent.includes(homedir()) && sent.includes('~/Library/nod.json'));
@@ -2733,6 +2820,114 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     };
   }
 
+  test(
+    'model setup returns while checks run and shows only the current result',
+    { timeout: 10_000 },
+    async (t) => {
+      const f = await fixture(t);
+      const definitions = await f.backend.catalog('openai', 'api_key');
+      const key = 'fixture-background-model-key';
+      const state = 'fixture-background-sign-in-state-12345';
+      const owner = await f.create('fixture-background-model-owner', {
+        ...f.backend,
+        catalog: async () => definitions,
+        connectKey: async (_provider, credential) => ({ credential, models: definitions }),
+        authorize: () => ({ url: 'https://model.example/sign-in', state, secret: {} }),
+        exchange: async () => ({ type: 'api_key', key: 'fixture-background-oauth-key' }),
+      });
+      const checks: { resolve(): void; reject(error: Error): void }[] = [];
+      await owner.setSelectionCheck(() => {
+        return new Promise<void>((resolve, reject) => checks.push({ resolve, reject }));
+      });
+      const app = Fastify();
+      owner.register(app);
+      t.after(async () => {
+        for (const check of checks) check.resolve();
+        await app.close();
+      });
+      const saved = await app.inject({
+        method: 'POST',
+        url: '/api/models/keys',
+        payload: { provider: 'openai', key },
+      });
+      assert.equal(saved.statusCode, 200, saved.body);
+      assert.equal(owner.current.checking, true);
+      assert.equal(checks.length, 1);
+
+      const endpoint = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: 'http://localhost:11434/v1' },
+      });
+      assert.equal(endpoint.statusCode, 200, endpoint.body);
+      const selection = owner.view().selection!;
+      const selected = await app.inject({
+        method: 'PUT',
+        url: '/api/models/selection',
+        payload: selection,
+      });
+      assert.equal(selected.statusCode, 200, selected.body);
+      assert.equal(checks.length, 2);
+      checks[0]!.reject(new Error('Synthetic old model failure.'));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(owner.current.checking, true);
+      assert.equal(owner.current.issue, undefined);
+
+      checks[1]!.reject(new Error(`HTTP 503: Synthetic service unavailable. ${key}`));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(owner.current.checking, false);
+      assert.match(owner.current.issue!.reason, /HTTP 503: Synthetic service unavailable/);
+      assert.doesNotMatch(owner.current.issue!.reason, /fixture-background-model-key/);
+      assert.deepEqual(owner.view().selectionIssue, owner.current.issue);
+      const access = await owner.resolve();
+      const complete = await access.prepareRequest!(selection.modelId, false);
+      await complete();
+      assert.equal(owner.current.issue, undefined);
+
+      await owner.select(selection);
+      const signIn = await app.inject({
+        method: 'POST',
+        url: '/api/models/oauth',
+        payload: { provider: 'openrouter' },
+      });
+      assert.equal(signIn.statusCode, 200, signIn.body);
+      const signedIn = await app.inject({
+        method: 'POST',
+        url: '/api/models/oauth/complete',
+        payload: {
+          url: `http://127.0.0.1:4310/api/models/oauth/callback?state=${state}&code=fixture-code`,
+        },
+      });
+      assert.equal(signedIn.statusCode, 200, signedIn.body);
+      assert.equal(owner.current.checking, true);
+      checks.at(-1)!.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(owner.current.checking, false);
+      assert.equal(owner.current.issue, undefined);
+
+      const connectionId = owner
+        .view()
+        .connections.find((row) => row.provider === 'compatible')!.id;
+      await owner.select({ ...selection, connectionId });
+      const previous = await owner.resolve();
+      const completePrevious = await previous.prepareRequest!(selection.modelId, false);
+      assert.equal(
+        await owner.addEndpoint('http://localhost:11434/v1', 'fixture-replacement-endpoint-key'),
+        connectionId,
+      );
+      checks.at(-1)!.reject(new Error('Synthetic new credential failure.'));
+      await new Promise((resolve) => setImmediate(resolve));
+      const issue = owner.view().selectionIssue;
+      assert.match(issue!.reason, /Synthetic new credential failure/);
+      await completePrevious();
+      assert.deepEqual(owner.current.issue, issue);
+      const current = await owner.resolve();
+      const completeCurrent = await current.prepareRequest!(selection.modelId, false);
+      await completeCurrent();
+      assert.equal(owner.current.issue, undefined);
+    },
+  );
+
   test('OpenAI connections keep their regions through selection, refresh and restart', async (t) => {
     const f = await fixture(t);
     const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
@@ -3413,15 +3608,48 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     await fallback.addKey('deepseek', 'fixture-fallback-key');
     assert.equal(fallback.view().selection?.modelId, 'fixture-small');
     assert.equal(fallback.view().selection?.effort, 'off');
-    const subscription = await f.create('fixture-subscription-default', {
-      ...backend,
+    const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+    let offered = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'];
+    const openaiBackend = {
+      ...createPiModelBackend({
+        fetch: async () =>
+          Response.json({
+            data: offered.map((id) => ({ id })),
+            models: offered.map((slug) => ({ slug, visibility: 'list' })),
+          }),
+      }),
       signIn: stubSignIn(async () => subscriptionCredential()),
-    });
-    const signIn = await subscription.start('openai');
-    await subscription.complete(
-      new URL(`http://127.0.0.1:1455/auth/callback?state=${signIn.attempt}&code=fixture`),
-    );
-    assert.equal(subscription.view().selection?.modelId, 'gpt-6-sol');
+    };
+    for (const method of ['api_key', 'subscription'] as const) {
+      const connect = async (owner: Awaited<ReturnType<typeof f.create>>) => {
+        if (method === 'api_key') await owner.addKey('openai', 'fixture-openai-default-key');
+        else {
+          const signIn = await owner.start('openai');
+          await owner.complete(
+            new URL(`http://127.0.0.1:1455/auth/callback?state=${signIn.attempt}&code=fixture`),
+          );
+        }
+      };
+      offered = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'];
+      const ownerId = `fixture-openai-default-${method}`;
+      const openai = await f.create(ownerId, openaiBackend);
+      await connect(openai);
+      assert.equal(openai.view().selection?.modelId, 'gpt-6.2-sol');
+      assert.equal(openai.view().selection?.effort, 'high');
+      const selected = { ...openai.view().selection!, modelId: 'gpt-6.1-sol' };
+      await openai.select(selected);
+      await openai.refreshCatalog(selected.connectionId);
+      assert.deepEqual(openai.view().selection, selected);
+      const restarted = await f.create(ownerId, openaiBackend);
+      assert.deepEqual(restarted.view().selection, selected);
+      offered = ['gpt-6-sol', 'gpt-6.1-sol'];
+      const legacy = await f.create(`${ownerId}-legacy`, openaiBackend);
+      await connect(legacy);
+      assert.equal(
+        legacy.view().selection?.modelId,
+        method === 'subscription' ? 'gpt-6-sol' : 'gpt-6.1-sol',
+      );
+    }
     const count = google.view().connections.length;
     for (const settings of [
       {},

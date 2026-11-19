@@ -36,8 +36,9 @@ export class ChannelMediaFailure extends Error {
     readonly fileLimitMb?: number,
     readonly httpStatus?: number,
     readonly serviceCode?: MessagingAttachmentReadError['serviceCode'],
+    cause?: unknown,
   ) {
-    super(reason);
+    super(reason, cause === undefined ? undefined : { cause });
   }
 }
 
@@ -86,7 +87,9 @@ export function createChannelMedia(options: {
               error.httpStatus,
               error.serviceCode,
             );
-          throw new ChannelMediaFailure('attachment_read_failed');
+          throw slack
+            ? new ChannelMediaFailure('attachment_read_failed')
+            : new ChannelMediaFailure('unavailable', undefined, undefined, undefined, error);
         }
         signal.throwIfAborted();
         total += bytes.length;
