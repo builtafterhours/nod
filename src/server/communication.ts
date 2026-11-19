@@ -505,9 +505,10 @@ export function createCommunication(options: {
         data,
         signal,
         supplied.success ? supplied.data : undefined,
-      ).then(
-        ({ text }) =>
-          `${mediaFailureText(text)}\n\nDiagnostic: ${data.reason}${data.httpStatus ? ` (HTTP ${data.httpStatus})` : ''}${data.serviceCode ? ` (${data.serviceCode})` : ''}.`,
+      ).then(({ text }) =>
+        'slack' in input && input.slack === true
+          ? `${mediaFailureText(text)}\n\nDiagnostic: ${data.reason}${data.httpStatus ? ` (HTTP ${data.httpStatus})` : ''}${data.serviceCode ? ` (${data.serviceCode})` : ''}.`
+          : text,
       );
     }
     return generate(threadId, input.kind, input, signal).then(({ text }) => text);

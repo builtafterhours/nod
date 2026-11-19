@@ -42,6 +42,7 @@ export type ChannelPresentation =
   | { kind: 'verification_refused' }
   | {
       kind: 'media_failure';
+      slack?: true;
       reason: ChannelMediaFailure['reason'];
       fileLimitMb?: number;
       httpStatus?: number;
@@ -740,11 +741,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           if (closed || replacing || receiveSignal.aborted || !permitted(identity)) return;
           if (error instanceof ChannelMediaFailure && error.cause)
             logFailure('channel_attachment_unavailable', error.cause);
-          const failure = preparationTimeout.aborted
-            ? new ChannelMediaFailure('preparation_timeout')
-            : error instanceof ChannelMediaFailure
-              ? error
-              : new ChannelMediaFailure('unavailable');
+          const failure =
+            identity.provider === 'slack' && preparationTimeout.aborted
+              ? new ChannelMediaFailure('preparation_timeout')
+              : error instanceof ChannelMediaFailure
+                ? error
+                : new ChannelMediaFailure('unavailable');
           if (modelMissingAtIntake || options.modelConfigured?.() === false) {
             await requestModelSetup();
             return;
@@ -763,6 +765,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                 text: '',
                 presentation: {
                   kind: 'media_failure',
+                  ...(identity.provider === 'slack' ? { slack: true as const } : {}),
                   ...(caption
                     ? { languageMessage: { at: sentAt.toISOString(), text: caption } }
                     : {}),

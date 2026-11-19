@@ -93,14 +93,15 @@ export function createChannelMedia(options: {
         }
         signal.throwIfAborted();
         total += bytes.length;
-        if (!bytes.length) throw new ChannelMediaFailure('attachment_empty');
+        if (!bytes.length)
+          throw new ChannelMediaFailure(slack ? 'attachment_empty' : 'unavailable');
         if (attachment.size && bytes.length !== attachment.size)
-          throw new ChannelMediaFailure('attachment_size_mismatch');
+          throw new ChannelMediaFailure(slack ? 'attachment_size_mismatch' : 'unavailable');
         if (total > 50 * 1024 * 1024) throw new ChannelMediaFailure('too_large');
         const video = slack && attachment.mimeType.toLowerCase().startsWith('video/');
         if (attachment.voice || video) {
           if (!video && !attachment.mimeType.startsWith('audio/'))
-            throw new ChannelMediaFailure('voice_mime_invalid');
+            throw new ChannelMediaFailure(slack ? 'voice_mime_invalid' : 'unavailable');
           if (bytes.length > 25 * 1024 * 1024) throw new ChannelMediaFailure('too_large');
           try {
             await beforeTranscribe?.();
