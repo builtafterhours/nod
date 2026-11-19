@@ -65,7 +65,7 @@ function mediaFailureText(text: string) {
     .min(1)
     .parse(
       plain(mediaMarkdown.parse(text)).replace(
-        /(?:[a-z][a-z0-9+.-]*:(?=\S)|www\.|(?<!\w)\/)[^\s<>]*|[\w.+-]+@[\w.-]+\.[a-z]{2,}|\b[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:[^\s<>]*)/gi,
+        /(?<![\p{L}\p{N}_])(?:[a-z][a-z0-9+.-]*:\/\/|www\.|\/(?=\S)|[\w.+-]+@[\w.-]+\.[a-z]{2,}|[a-z0-9][a-z0-9.-]*\.[a-z]{2,})[^\s<>]*/giu,
         '',
       ),
     );
