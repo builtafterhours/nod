@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { deserialize, serialize } from 'node:v8';
 import type { Pool } from 'pg';
+import { logRepeatedFailure } from '../../ports/failure-log.ts';
 import type { CredentialKeyStore } from '../../ports/key-store.ts';
 import { MessagingConnectionError } from '../../ports/messaging.ts';
 
@@ -88,28 +89,45 @@ export function createSlackIntake<T>(pool: Pool, owner: string, keyStore: Creden
     },
     async next(installation: string, before?: string) {
       await initialize();
-      const row = (
-        await pool.query<{ message_ts: string; ciphertext: Buffer }>(
-          `SELECT message_ts,ciphertext FROM channel_slack_intake
-         WHERE owner_id=$1 AND installation=$2
-           AND created_at >= now()-interval '24 hours'
-           AND ($3::numeric IS NULL OR message_ts::numeric < $3::numeric)
-         ORDER BY message_ts::numeric LIMIT 1`,
-          [owner, installation, before ?? null],
-        )
-      ).rows[0];
-      if (!row) return;
-      const key = await keyStore.getKey();
-      const bytes = row.ciphertext;
-      const decipher = createDecipheriv('aes-256-gcm', key, bytes.subarray(0, 12));
-      decipher.setAAD(binding(installation, row.message_ts));
-      decipher.setAuthTag(bytes.subarray(12, 28));
-      return {
-        ts: row.message_ts,
-        value: deserialize(
-          Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]),
-        ) as T,
-      };
+      let key: Buffer | undefined;
+      for (;;) {
+        const row = (
+          await pool.query<{ message_ts: string; ciphertext: Buffer }>(
+            `SELECT message_ts,ciphertext FROM channel_slack_intake
+           WHERE owner_id=$1 AND installation=$2
+             AND created_at >= now()-interval '24 hours'
+             AND ($3::numeric IS NULL OR message_ts::numeric < $3::numeric)
+           ORDER BY message_ts::numeric LIMIT 1`,
+            [owner, installation, before ?? null],
+          )
+        ).rows[0];
+        if (!row) return;
+        key ??= await keyStore.getKey();
+        if (key.length !== 32) throw new MessagingConnectionError('Slack intake key is invalid.');
+        const bytes = row.ciphertext;
+        try {
+          const decipher = createDecipheriv('aes-256-gcm', key, bytes.subarray(0, 12));
+          decipher.setAAD(binding(installation, row.message_ts));
+          decipher.setAuthTag(bytes.subarray(12, 28));
+          return {
+            ts: row.message_ts,
+            value: deserialize(
+              Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]),
+            ) as T,
+          };
+        } catch {
+          await pool.query(
+            `DELETE FROM channel_slack_intake
+             WHERE owner_id=$1 AND installation=$2 AND message_ts=$3 AND ciphertext=$4`,
+            [owner, installation, row.message_ts, bytes],
+          );
+          logRepeatedFailure(
+            'slack_attachment_unreadable',
+            'slack_attachment_unreadable',
+            undefined,
+          );
+        }
+      }
     },
     async complete(installation: string, ts: string, sourceId: string) {
       return Boolean(

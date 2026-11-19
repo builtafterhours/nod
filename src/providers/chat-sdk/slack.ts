@@ -606,7 +606,8 @@ export function createSlackTransport(
   >();
   const active = new Set<Promise<unknown>>();
   const intake = createSlackIntake<StagedMessage>(pool, options.ownerId, options.keyStore);
-  const staging = new Map<string, { ack(): Promise<void> }>();
+  const staging = new Map<string, { ack(): Promise<void>; download?: () => Promise<void> }>();
+  let stagingDownloads = 0;
   let nextIntakePrune = 0;
   let ready: Promise<unknown> | undefined;
   const table = () =>
@@ -754,6 +755,33 @@ export function createSlackTransport(
 
   const sourceId = (dm: string, ts: string) => `channel:slack:${channel.accountId}:${dm}:${ts}`;
 
+  function startStaging() {
+    if (closed || stagingDownloads >= 2) return;
+    for (const [key, item] of staging) {
+      const download = item.download;
+      if (!download) continue;
+      delete item.download;
+      stagingDownloads++;
+      const pending = download()
+        .catch((error) => {
+          if (!closed)
+            logRepeatedFailure(
+              'slack_attachment_stage_failed',
+              'slack_attachment_stage_failed',
+              error instanceof MessagingConnectionError ? error : undefined,
+            );
+        })
+        .finally(() => {
+          if (staging.get(key) === item) staging.delete(key);
+          active.delete(pending);
+          stagingDownloads--;
+          startStaging();
+        });
+      active.add(pending);
+      return;
+    }
+  }
+
   function stage(
     event: SlackEvent & { ts: string },
     scope: string,
@@ -766,13 +794,23 @@ export function createSlackTransport(
       previous.ack = ack;
       return;
     }
-    if (staging.size >= 2) return;
-    const current = { ack };
+    if (staging.size >= 100) {
+      logRepeatedFailure(
+        'slack_attachment_backlog_full',
+        'slack_attachment_backlog_full',
+        undefined,
+      );
+      return;
+    }
+    const thread = options.captureThread();
+    void thread.catch(() => {});
+    const current = { ack, download };
     staging.set(key, current);
     const signal = lifetime.signal;
-    const pending = (async () => {
+    async function download() {
+      signal.throwIfAborted();
       if (!(await intake.known(scope, event.ts, sourceId(dm, event.ts)))) {
-        const threadId = await options.captureThread();
+        const threadId = await thread;
         const files: StagedFile[] = [];
         let total = 0;
         for (const file of event.files ?? []) {
@@ -817,20 +855,8 @@ export function createSlackTransport(
       }
       staging.delete(key);
       if (!signal.aborted) await current.ack().catch(() => {});
-    })()
-      .catch((error) => {
-        if (!signal.aborted)
-          logRepeatedFailure(
-            'slack_attachment_stage_failed',
-            'slack_attachment_stage_failed',
-            error instanceof MessagingConnectionError ? error : undefined,
-          );
-      })
-      .finally(() => {
-        if (staging.get(key) === current) staging.delete(key);
-        active.delete(pending);
-      });
-    active.add(pending);
+    }
+    startStaging();
   }
 
   function start() {
@@ -1970,6 +1996,7 @@ export function createSlackTransport(
       channel.available = false;
       lifetime.abort();
       incoming.clear();
+      staging.clear();
       await connection?.disconnect().catch(() => {});
       await starting?.catch(() => {});
       await Promise.allSettled(active);

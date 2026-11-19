@@ -121,7 +121,7 @@ For what Nod stores and for how long, see the [Security review guide](/trust/sec
 
 Model keys Nod saves are encrypted at rest. Keys you set in a shell or `.env` file use that configuration's storage protections. Nod does not add model keys to prompts, its workspace or its browser.
 
-Nod temporarily stages incoming Slack attachments and captions in an encrypted local queue so a restart does not require another download. Staged copies are cleared after Nod admits, rejects, or discards the input; pending entries expire after 24 hours and are removed during Slack polling. Normal accepted task attachments remain in their conversation workspace.
+Nod temporarily stages incoming Slack attachments and captions in an encrypted local queue so a restart does not require another download. Nod clears the staged copy once it records the intake outcome, and removes unreadable entries during replay. Rejected input with no recorded outcome can stay in the queue until it expires after 24 hours. Expired entries are removed during Slack polling. Normal accepted task attachments remain in their conversation workspace.
 
 ### Composio Zero Data Retention
 
