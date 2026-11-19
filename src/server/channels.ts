@@ -234,7 +234,7 @@ function localHost(hostname: string) {
     host === '[::]' ||
     host.endsWith('.localhost') ||
     /^127\.\d+\.\d+\.\d+$/.test(host) ||
-    /^\[::ffff:(?:7f[0-9a-f]{2}:|127\.)/.test(host)
+    /^\[::(?:ffff:)?(?:7f[0-9a-f]{2}:|127\.)/.test(host)
   );
 }
 
@@ -253,7 +253,7 @@ function addresses(values: Array<[string, boolean]>, check: (candidate: string) 
     return true;
   };
   for (const [value, paths] of values) {
-    for (const match of value.matchAll(/:[/\\]{2}/g)) {
+    for (const match of value.matchAll(/:[/\\]{1,2}/g)) {
       const scheme = /https?$/i.exec(value.slice(Math.max(0, match.index - 5), match.index));
       if (scheme && !inspect(value, match.index - scheme[0].length)) return false;
     }
@@ -276,13 +276,9 @@ function channelText(text: string) {
     } catch {
       return false;
     }
-    let path = url.pathname;
-    try {
-      path = decodeURIComponent(path);
-    } catch {
-      secureAction = true;
-      return true;
-    }
+    const path = url.pathname.replace(/%([0-7][0-9a-f])/gi, (_, code: string) =>
+      String.fromCharCode(Number.parseInt(code, 16)),
+    );
     if (path.startsWith('/api/artifacts/')) {
       artifact = true;
       return true;
