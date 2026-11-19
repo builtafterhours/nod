@@ -85,13 +85,26 @@ function exact(node: Node, source: string) {
       const match = /^(`+)([^\n]*?)\1$/.exec(raw);
       return Boolean(match && match[2] === node.value);
     }
+    if (node.type === 'image')
+      return (
+        /^https?:\/\/\S+$/.test(node.url) &&
+        !node.title &&
+        raw === `![${node.alt ?? ''}](${node.url})`
+      );
     if (node.type === 'link') {
+      if (!raw.startsWith('['))
+        return (
+          !node.title &&
+          node.children.length === 1 &&
+          node.children[0].type === 'text' &&
+          node.children[0].value === raw &&
+          /^\S+$/.test(raw)
+        );
       if (
-        !/^(https?|mailto|tel):/i.test(node.url) ||
+        !/^(https?:\/\/|mailto:|tel:)/.test(node.url) ||
         node.title ||
         /\s/.test(node.url) ||
         node.children.some((child) => child.type !== 'text') ||
-        !raw.startsWith('[') ||
         !raw.endsWith(`](${node.url})`)
       )
         return false;
@@ -107,12 +120,7 @@ function exact(node: Node, source: string) {
   };
   const a = node.position?.start.offset;
   const b = node.position?.end.offset;
-  return (
-    a !== undefined &&
-    b !== undefined &&
-    !/[&\\<%\t]/u.test(source.slice(a, b)) &&
-    walk(node, a, b, 0)
-  );
+  return a !== undefined && b !== undefined && walk(node, a, b, 0);
 }
 
 function pack(units: SlackUnit[], native: boolean) {
@@ -207,6 +215,16 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           ...style,
           [node.type === 'strong' ? 'bold' : node.type === 'emphasis' ? 'italic' : 'strike']: true,
         };
+      }
+      if (node.type === 'image')
+        return [{ text: node.alt || node.url, url: node.url, style, end: end(node) }];
+      if (node.type === 'link' && !source.startsWith('[', start(node))) {
+        const raw = source.slice(start(node), end(node));
+        return [
+          /^https?:\/\//.test(raw) && node.url === raw
+            ? { text: raw, url: raw, style, end: end(node) }
+            : { text: raw, style, from: start(node), end: end(node) },
+        ];
       }
       if (node.type === 'link')
         return [
@@ -352,6 +370,7 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
         if (
           value &&
           value.length <= 150 &&
+          !/[&<>]/.test(value) &&
           spans.every((s) => !s.url && !s.raw && !Object.values(s.style ?? {}).some(Boolean))
         ) {
           units.push({
@@ -371,7 +390,13 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
       } else if (node.type === 'paragraph')
         emit(leaf(node), { type: 'section' }, end(node), units.length ? separator : '');
       else if (node.type === 'code') {
-        const raw = source.slice(start(node), end(node));
+        const lineStart = source.lastIndexOf('\n', start(node) - 1) + 1;
+        const pad = start(node) - lineStart;
+        if (/[^ ]/.test(source.slice(lineStart, start(node)))) throw new Error('native_shape');
+        const lines = source.slice(start(node), end(node)).split('\n');
+        if (lines.slice(1).some((line) => line && !line.startsWith(' '.repeat(pad))))
+          throw new Error('native_shape');
+        const raw = lines.map((line, index) => (index ? line.slice(pad) : line)).join('\n');
         const match = /^(`{3,}|~{3,})([\w#+.-]*)\n([\s\S]*?)\n\1$/.exec(raw);
         if (
           !match ||
@@ -379,26 +404,30 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           match[3] !== node.value ||
           (node.lang ?? '').length > 80 ||
           (node.lang ?? '') !== match[2] ||
-          node.meta ||
-          /[&\\<%\t]/u.test(raw)
+          node.meta
         )
           throw new Error('native_shape');
         const bodyFrom = source.indexOf('\n', start(node)) + 1;
         emit(
-          [{ text: node.value, from: bodyFrom, end: bodyFrom + node.value.length }],
+          [
+            pad
+              ? { text: node.value, end: end(node) }
+              : { text: node.value, from: bodyFrom, end: bodyFrom + node.value.length },
+          ],
           { type: 'code', ...(node.lang ? { language: node.lang } : {}) },
           end(node),
           units.length ? separator : '',
         );
       } else if (node.type === 'blockquote') {
-        if (node.children.length !== 1 || node.children[0].type !== 'paragraph')
+        if (node.children.some((child) => child.type !== 'paragraph'))
           throw new Error('native_shape');
-        emit(
-          leaf(node.children[0], {}, true),
-          { type: 'quote' },
-          end(node),
-          units.length ? separator : '',
-        );
+        for (const [index, child] of node.children.entries())
+          emit(
+            leaf(child, {}, true),
+            { type: 'quote' },
+            index === node.children.length - 1 ? end(node) : end(child),
+            units.length ? (index ? '\n' : separator) : '',
+          );
       } else if (node.type === 'list') {
         if (indent > 8) throw new Error('native_indent');
         if (
@@ -414,7 +443,7 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
         for (const [index, item] of node.children.entries()) {
           if (
             item.children[0]?.type !== 'paragraph' ||
-            item.children.slice(1).some((child) => child.type !== 'list')
+            item.children.slice(1).some((child) => child.type !== 'list' && child.type !== 'code')
           )
             throw new Error('native_shape');
           for (const child of item.children) framed(child, start(item), end(item));
