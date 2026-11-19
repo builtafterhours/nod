@@ -533,7 +533,22 @@ export async function createChannelSettings(
       let pairingUrl: string | undefined;
       if (input !== undefined) {
         const encryption = await encryptionKey();
-        const verified = await options.verifier.verify(provider, input);
+        const update =
+          provider === 'slack' &&
+          oldEnvironment.SLACK_ENABLED === 'true' &&
+          input &&
+          typeof input === 'object' &&
+          !Array.isArray(input)
+            ? {
+                botToken: oldEnvironment.SLACK_BOT_TOKEN,
+                appToken: oldEnvironment.SLACK_APP_TOKEN,
+                teamId: oldEnvironment.SLACK_TEAM_ID,
+                allowedUserId: oldEnvironment.SLACK_ALLOWED_USER_ID,
+                richEnabled: oldEnvironment.SLACK_RICH_ENABLED === 'true',
+                ...input,
+              }
+            : input;
+        const verified = await options.verifier.verify(provider, update);
         configured = z.record(z.string(), z.string().max(8192)).parse(verified.environment);
         if (Object.keys(configured).some((key) => !fields[provider].has(key)))
           throw new Error('Invalid channel configuration.');

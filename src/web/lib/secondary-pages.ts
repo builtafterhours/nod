@@ -160,10 +160,10 @@ export function channelSetupBody(
   const webhookUrl = fields.webhookUrl?.trim() || undefined;
   if (provider === 'slack')
     return {
-      botToken: fields.botToken?.trim(),
-      appToken: fields.appToken?.trim(),
-      teamId: fields.teamId?.trim(),
-      allowedUserId: fields.allowedUserId?.trim(),
+      botToken: fields.botToken?.trim() || undefined,
+      appToken: fields.appToken?.trim() || undefined,
+      teamId: fields.teamId?.trim() || undefined,
+      allowedUserId: fields.allowedUserId?.trim() || undefined,
       richEnabled: fields.richEnabled === 'true',
     };
   if (provider === 'telegram')

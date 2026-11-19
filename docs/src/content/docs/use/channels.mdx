@@ -164,7 +164,7 @@ An in-thread answer uses only that thread's current, fully delivered Nod message
 
 1. In your Slack app settings, declare the app as an agent with **Agent messaging experience** (`agent_view`). Add `assistant:write` alongside the scopes above. Some AI features require a paid Slack plan; settings alone do not prove availability.
 2. Subscribe to `agent_session_stopped` alongside the three existing bot events. Enable **Interactivity**. Keep Socket Mode enabled; no public request URL or slash commands are needed.
-3. Apply the new permissions in Slack, then select **Channels → Manage Slack → Update connection**. Enter the credentials and select **Rich Slack (requires agent setup)**. For a managed connection, set `SLACK_RICH_ENABLED=true` and apply your configuration.
+3. Apply the new permissions in Slack, then select **Channels → Manage Slack → Update connection** and select **Rich Slack (requires agent setup)**. Leave unchanged fields blank to keep their saved values. If Slack changed a token, enter its replacement. For a managed connection, set `SLACK_RICH_ENABLED=true` and apply your configuration.
 
 Switching an older `assistant_view` app to `agent_view` is irreversible. Nod does not change your Slack installation for you. **Reconnect** verifies identity again; it does not grant new scopes. Manage shows that rich mode was requested, and reports supported fallback errors without exposing credentials.
 

@@ -540,6 +540,7 @@ export function Channels() {
     setRemoving(provider);
   }
   const selected = channels.find((channel) => channel.provider.id === editing);
+  const updatingSlack = editing === 'slack' && selected?.setup?.enabled === true;
   const managing = Boolean(
     selected?.setup?.enabled &&
     !whatsappCloud &&
@@ -803,10 +804,12 @@ export function Channels() {
             <>
               <DialogTitle className="channel-wizard-title">
                 <img src="/logos/slack.svg" alt="" width={24} height={24} />
-                Connect Slack
+                {updatingSlack ? 'Update Slack connection' : 'Connect Slack'}
               </DialogTitle>
               <DialogDescription>
-                Connect a Slack app in Socket Mode to your own direct message.
+                {updatingSlack
+                  ? 'Leave any field blank to keep its saved value.'
+                  : 'Connect a Slack app in Socket Mode to your own direct message.'}
               </DialogDescription>
               <p>
                 <ExternalLinkText href="https://nod.n8n.io/docs/use/channels/#slack-setup">
@@ -828,9 +831,9 @@ export function Channels() {
                     <Input
                       type={secret ? 'password' : 'text'}
                       value={fields[String(name)] ?? ''}
-                      placeholder={String(placeholder)}
+                      placeholder={updatingSlack ? 'Saved' : String(placeholder)}
                       autoComplete="off"
-                      required
+                      required={!updatingSlack}
                       disabled={busy || !settings?.ready}
                       onChange={(event) =>
                         setFields((current) => ({ ...current, [String(name)]: event.target.value }))
@@ -853,8 +856,8 @@ export function Channels() {
                 </label>
                 {(error || loadError) && <Notice kind="error">{error || loadError}</Notice>}
                 <div className="dialog-actions">
-                  <Button type="submit" disabled={busy || !settings?.ready}>
-                    {busy ? <Loading /> : 'Connect Slack'}
+                  <Button type="submit" disabled={busy || !settings?.ready} aria-busy={busy}>
+                    {updatingSlack ? 'Save changes' : 'Connect Slack'}
                   </Button>
                 </div>
               </form>
