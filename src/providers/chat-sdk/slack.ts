@@ -335,12 +335,14 @@ export async function verifySlack(input: unknown, request: typeof fetch = fetch)
 
 const fileSchema = z.object({
   id: z.string().regex(/^F[A-Z0-9]{1,63}$/),
-  name: z.string().min(1).max(255),
+  name: z.string().min(1).max(255).nullish(),
+  filetype: z.string().optional(),
   mimetype: z.string().min(1).max(200),
   size: z.number().int().nonnegative(),
   url_private_download: z.string().max(2048).optional(),
   url_private: z.string().max(2048).optional(),
   subtype: z.string().optional(),
+  file_access: z.string().optional(),
   mode: z.string().optional(),
   user: z.string().optional(),
 });
@@ -592,8 +594,9 @@ export function createSlackTransport(
       }));
 
   function attachment(file: z.infer<typeof fileSchema>): MessagingAttachment {
+    const extension = /^[a-z0-9]{1,16}$/.test(file.filetype ?? '') ? `.${file.filetype}` : '';
     return {
-      name: file.name,
+      name: file.name ?? `file-${file.id}${extension}`,
       mimeType: file.mimetype,
       size: file.size,
       ...(file.mimetype.startsWith('audio/') ? { voice: true } : {}),
@@ -638,15 +641,36 @@ export function createSlackTransport(
     };
   }
 
-  function incomingAttachment(value: unknown): MessagingAttachment {
+  async function incomingAttachment(value: unknown): Promise<MessagingAttachment> {
     const file = fileSchema.safeParse(value);
-    if (file.success) return attachment(file.data);
+    if (
+      file.success &&
+      file.data.file_access !== 'check_file_info' &&
+      (file.data.url_private_download ?? file.data.url_private)
+    )
+      return attachment(file.data);
+    const reference = fileSchema.pick({ id: true }).safeParse(value);
+    let error = new MessagingConnectionError('Slack failed: file_metadata_unavailable.');
+    if (reference.success) {
+      try {
+        const result = await web!.files.info({ file: reference.data.id });
+        const resolved = fileSchema.safeParse(result.file);
+        if (
+          resolved.success &&
+          resolved.data.id === reference.data.id &&
+          resolved.data.file_access !== 'check_file_info'
+        )
+          return attachment(resolved.data);
+      } catch (cause) {
+        error = failure(cause);
+      }
+    }
     return {
       name: 'Unavailable Slack file',
       mimeType: 'application/octet-stream',
       size: 0,
       async read() {
-        throw new MessagingConnectionError('Slack failed: file_metadata_unavailable.');
+        throw error;
       },
     };
   }
@@ -1334,6 +1358,10 @@ export function createSlackTransport(
             .replaceAll('&gt;', '>')
             .replaceAll('&amp;', '&');
           const command = /^nod\s+(usage|memory|tasks|status|stop)$/i.exec(text.trim());
+          const attachments = event.files?.length
+            ? await Promise.all(event.files.map(incomingAttachment))
+            : undefined;
+          if (closed) return;
           await accept({
             channelId: 'slack',
             accountId: parsed.data.teamId,
@@ -1347,7 +1375,7 @@ export function createSlackTransport(
             ...(event.thread_ts && event.thread_ts !== event.ts
               ? { replyToMessageId: `${verified!.dmId}:${event.thread_ts}` }
               : {}),
-            ...(event.files?.length ? { attachments: event.files.map(incomingAttachment) } : {}),
+            ...(attachments ? { attachments } : {}),
           } satisfies InboundMessage);
         } else if (react && event.item?.type === 'message' && event.reaction && event.event_ts) {
           const emoji = reactionEmoji(event.reaction);
