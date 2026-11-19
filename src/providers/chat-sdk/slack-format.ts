@@ -66,18 +66,6 @@ const linkable = (url: string) =>
   /^(?:https?:\/\/|mailto:|tel:)[^\s()<>"`\\{}|^]+$/.test(url) &&
   !/&(?:#|[a-z][a-z0-9]*;)/i.test(url);
 
-const host = (url: string) => {
-  try {
-    return /^https?:\/\//.test(url) ? new URL(url).host : undefined;
-  } catch {
-    return undefined;
-  }
-};
-const seen = (text: string) => {
-  const match = /^https?:\/\/[^\s)]+/.exec(text)?.[0];
-  return match ? host(match) : undefined;
-};
-
 function exact(node: Node, source: string) {
   const parents = new Set(['paragraph', 'heading', 'tableCell', 'strong', 'emphasis', 'delete']);
   let count = 0;
@@ -101,13 +89,7 @@ function exact(node: Node, source: string) {
       const match = /^(`+)([^\n]*?)\1$/.exec(raw);
       return Boolean(match && match[2] === node.value);
     }
-    if (node.type === 'image')
-      return (
-        /^https?:\/\//.test(node.url) &&
-        linkable(node.url) &&
-        !node.title &&
-        raw === `![${node.alt ?? ''}](${node.url})`
-      );
+    if (node.type === 'image') return !node.title && raw === `![${node.alt ?? ''}](${node.url})`;
     if (node.type === 'link') {
       if (!raw.startsWith('['))
         return (
@@ -232,16 +214,10 @@ export function slackPlan(source: string, metadata = false): SlackPlan {
           [node.type === 'strong' ? 'bold' : node.type === 'emphasis' ? 'italic' : 'strike']: true,
         };
       }
-      if (node.type === 'image')
-        return [{ text: node.alt || node.url, url: node.url, style, end: end(node) }];
-      if (node.type === 'link' && !source.startsWith('[', start(node))) {
-        const raw = source.slice(start(node), end(node));
+      if (node.type === 'image' || (node.type === 'link' && !source.startsWith('[', start(node))))
         return [
-          node.url === raw && linkable(raw) && seen(source.slice(start(node))) === host(raw)
-            ? { text: raw, url: raw, style, end: end(node) }
-            : { text: raw, style, from: start(node), end: end(node) },
+          { text: source.slice(start(node), end(node)), style, from: start(node), end: end(node) },
         ];
-      }
       if (node.type === 'link')
         return [
           {
